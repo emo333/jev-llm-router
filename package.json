@@ -1,0 +1,47 @@
+{
+  "name": "jev-llm-router",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Jev model and thinking-level routing across Pi's scoped models",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emo333/jev-llm-router.git"
+  },
+  "homepage": "https://github.com/emo333/jev-llm-router#readme",
+  "bugs": {
+    "url": "https://github.com/emo333/jev-llm-router/issues"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/jev-llm-rtr.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@types/node": "^22.19.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
