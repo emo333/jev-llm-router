@@ -1,5 +1,6 @@
 import { clampThinkingLevel, getSupportedThinkingLevels, getSystemMessageText, type Api, type ClassifierAnswer, type ClassifierContext, type ClassifierQuestion, type Message, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { VIRTUAL_MODEL_STATE_ENTRY, type ExtensionAPI, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
+import { VERSION, VIRTUAL_MODEL_STATE_ENTRY, type ExtensionAPI, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { localModelName } from "./local-model-name.ts";
 import { clampToCandidateLevels, describeThinkingCap, loadRouterConfig, routerConfigPath, saveThinkingLevelCap, thinkingLevelsForModel, type RouterConfig } from "./router-config.ts";
 
@@ -239,14 +240,14 @@ function routeState(value: unknown): RouteState | undefined {
   return state as RouteState;
 }
 
-function showRoute(ctx: ExtensionContext, state: RouteState): void {
+function showRoute(ctx: ExtensionContext, state: RouteState, historical = false): void {
   if (ctx.mode !== "tui") return;
   const model = ctx.modelRegistry.find(state.provider, state.id);
-  const level = model ? clampThinkingLevel(model, state.thinkingLevel) : state.thinkingLevel;
-  ctx.ui.setStatus(STATUS_KEY, `Jev: ${state.provider}/${state.id} · ${level}`);
+  const level = !historical && model ? clampThinkingLevel(model, state.thinkingLevel) : state.thinkingLevel;
+  ctx.ui.setStatus(STATUS_KEY, `Jev: ${historical ? "last dispatched " : ""}${state.provider}/${state.id} · ${level}`);
 }
 
-function restoreStatus(ctx: ExtensionContext, selected = ctx.model): void {
+function restoreStatus(ctx: ExtensionContext, selected = ctx.model): RouteState | undefined {
   if (ctx.mode !== "tui") return;
   if (selected?.provider !== "jev" || selected.id !== "auto") {
     ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -258,8 +259,8 @@ function restoreStatus(ctx: ExtensionContext, selected = ctx.model): void {
     if (data?.provider !== "jev" || data.modelId !== "auto") continue;
     const state = routeState(data.state);
     if (state) {
-      showRoute(ctx, state);
-      return;
+      showRoute(ctx, state, true);
+      return state;
     }
     break;
   }
@@ -285,6 +286,38 @@ function scopedModelReport(ctx: ExtensionContext, config: RouterConfig): string 
   const lines = scopedPhysicalModels(ctx).map((model) => `- ${model.provider}/${model.id}: ${describeThinkingCap(model, config)}`);
   if (!lines.length) lines.push("- No available physical models in the current scope.");
   return [`Jev scoped models (highest allowed thinking level):`, ...lines, `Config: ${routerConfigPath()}`].join("\n");
+}
+
+async function showStartupHeader(ctx: ExtensionContext, lastRoute: RouteState | undefined): Promise<void> {
+  if (ctx.mode !== "tui") return;
+  const active = ctx.model?.provider === "jev" && ctx.model.id === "auto";
+  const selected = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
+  const settings = [
+    `Router: jev/auto (${active ? "active" : "bypassed"})`,
+    `Selected model: ${selected}`,
+    `Thinking: ${active ? "automatic, within scoped model caps" : ctx.thinkingLevel ?? "unknown"}`,
+  ];
+  if (lastRoute) settings.push(`Last dispatched: ${lastRoute.provider}/${lastRoute.id} · ${lastRoute.thinkingLevel}`);
+  let error: string | undefined;
+  try {
+    settings.push("", scopedModelReport(ctx, await loadRouterConfig()));
+  } catch (cause) {
+    error = cause instanceof Error ? cause.message : String(cause);
+  }
+  const body = settings.join("\n");
+  ctx.ui.setHeader((_tui, theme) => {
+    const text = new Text("", 0, 0);
+    const update = () => text.setText([
+      theme.fg("accent", `Pi v${VERSION} · Jev startup settings`),
+      body,
+      ...(error ? ["", theme.fg("error", `Jev settings unavailable: ${error}`)] : []),
+    ].join("\n"));
+    update();
+    return {
+      render: (width: number) => text.render(width),
+      invalidate: update,
+    };
+  });
 }
 
 export default function (pi: ExtensionAPI) {
@@ -325,9 +358,16 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
-  pi.on("session_start", (_event, ctx) => restoreStatus(ctx));
-  pi.on("session_tree", (_event, ctx) => restoreStatus(ctx));
-  pi.on("model_select", (event, ctx) => restoreStatus(ctx, event.model));
+  pi.on("session_start", async (_event, ctx) => {
+    const lastRoute = restoreStatus(ctx);
+    await showStartupHeader(ctx, lastRoute);
+  });
+  pi.on("session_tree", (_event, ctx) => {
+    restoreStatus(ctx);
+  });
+  pi.on("model_select", (event, ctx) => {
+    restoreStatus(ctx, event.model);
+  });
   pi.on("session_shutdown", (_event, ctx) => {
     if (ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
   });

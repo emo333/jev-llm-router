@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
+import { visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { after, before, beforeEach, test } from "node:test";
 import type { Api, ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierResult, Message, Model, ModelsClassifierOptions } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel, ModelRouteRequest, ScopedModel, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel, ModelRouteRequest, ScopedModel, SessionEntry, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import extension, { route, routingContext } from "../src/jev-llm-rtr.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -107,18 +109,25 @@ function fixture(
 
 function statusFixture(ctx: ExtensionContext, mode: ExtensionContext["mode"] = "tui", selections: (string | undefined)[] = []) {
   let definition: ExtensionVirtualModel<NonNullable<RouteRequest["state"]>> | undefined;
-  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => void>();
-  const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
+  const handlers = new Map<string, (event: { type: string; [key: string]: unknown }, ctx: ExtensionContext) => void | Promise<void>>();
+  const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   const statuses: (string | undefined)[] = [];
   const notifications: { message: string; type?: string }[] = [];
   const selectCalls: { title: string; options: string[] }[] = [];
   const branch: SessionEntry[] = [];
+  let header: Component | undefined;
   Object.assign(ctx, {
     mode,
     hasUI: mode === "tui" || mode === "rpc",
     model: virtual,
     sessionManager: { getBranch: () => branch },
     ui: {
+      setHeader: (factory: Parameters<ExtensionContext["ui"]["setHeader"]>[0]) => {
+        // This header uses only theme colors and never interacts with the TUI.
+        const tui = {} as TUI;
+        const theme = { fg: (_color: ThemeColor, text: string) => text } as Theme;
+        header = factory?.(tui, theme);
+      },
       setStatus: (key: string, text: string | undefined) => {
         assert.equal(key, "jev-router");
         statuses.push(text);
@@ -131,13 +140,13 @@ function statusFixture(ctx: ExtensionContext, mode: ExtensionContext["mode"] = "
     },
   });
   extension({
-    on: (event: string, handler: (event: any, ctx: ExtensionContext) => void) => handlers.set(event, handler),
-    registerCommand: (name: string, options: any) => commands.set(name, options.handler),
+    on: (event: string, handler: (event: { type: string; [key: string]: unknown }, ctx: ExtensionContext) => void | Promise<void>) => handlers.set(event, handler),
+    registerCommand: (name: string, options: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => commands.set(name, options.handler),
     registerVirtualModel: (value: typeof definition) => {
       definition = value;
     },
   } as unknown as ExtensionAPI);
-  return { definition: definition!, statuses, notifications, selectCalls, commands, branch, emit: (type: string, data = {}) => handlers.get(type)!({ type, ...data }, ctx) };
+  return { definition: definition!, statuses, notifications, selectCalls, commands, branch, get header() { return header; }, emit: (type: string, data = {}) => handlers.get(type)!({ type, ...data }, ctx) };
 }
 
 function storedRoute(id: string, thinkingLevel: string, modelId = "auto"): SessionEntry {
@@ -571,22 +580,24 @@ test("compaction and other direct routes do not overwrite the main status", asyn
 test("JSON, print, and RPC routes do not write terminal status output", async () => {
   for (const mode of ["json", "print", "rpc"] as const) {
     const { ctx } = fixture();
-    const { definition, statuses, emit } = statusFixture(ctx, mode);
-    emit("session_start");
+    const display = statusFixture(ctx, mode);
+    const { definition, statuses, emit } = display;
+    await emit("session_start");
     await definition.route(request(), ctx);
     emit("model_select", { model: fast });
     emit("session_shutdown");
     assert.deepEqual(statuses, []);
+    assert.equal(display.header, undefined);
   }
 });
 
-test("new sessions show awaiting prompt, and reload restores the latest branch route", () => {
+test("new sessions show awaiting prompt, and reload restores the latest branch route", async () => {
   const { ctx } = fixture();
   const { statuses, branch, emit } = statusFixture(ctx);
-  emit("session_start");
+  await emit("session_start");
   branch.push(storedRoute("fast", "low"), storedRoute("strong", "high"));
-  emit("session_start", { reason: "reload" });
-  assert.deepEqual(statuses, ["Jev: awaiting prompt", "Jev: test/strong · high"]);
+  await emit("session_start", { reason: "reload" });
+  assert.deepEqual(statuses, ["Jev: awaiting prompt", "Jev: last dispatched test/strong · high"]);
 });
 
 test("tree navigation updates the status from the new branch rather than global history", () => {
@@ -596,7 +607,7 @@ test("tree navigation updates the status from the new branch rather than global 
   emit("session_tree");
   branch.splice(0, branch.length, storedRoute("fast", "low"));
   emit("session_tree");
-  assert.deepEqual(statuses, ["Jev: test/strong · high", "Jev: test/fast · low"]);
+  assert.deepEqual(statuses, ["Jev: last dispatched test/strong · high", "Jev: last dispatched test/fast · low"]);
 });
 
 test("manual model selection clears the Jev status, and reselecting auto restores it", () => {
@@ -606,17 +617,81 @@ test("manual model selection clears the Jev status, and reselecting auto restore
   emit("model_select", { model: fast });
   emit("model_select", { model: virtual });
   emit("session_shutdown");
-  assert.deepEqual(statuses, [undefined, "Jev: test/fast · low", undefined]);
+  assert.deepEqual(statuses, [undefined, "Jev: last dispatched test/fast · low", undefined]);
 });
 
-test("invalid or unrelated router state never produces a misleading dispatch status", () => {
+test("invalid or unrelated router state never produces a misleading dispatch status", async () => {
   const { ctx } = fixture();
   const { statuses, branch, emit } = statusFixture(ctx);
   branch.push(storedRoute("strong", "high", "another-router"));
-  emit("session_start");
+  await emit("session_start");
   branch.push(storedRoute("strong", "unsupported"));
-  emit("session_start");
+  await emit("session_start");
   assert.deepEqual(statuses, ["Jev: awaiting prompt", "Jev: awaiting prompt"]);
+});
+
+test("startup renders configured caps, model maxima, and automatic thinking without choosing a route", async () => {
+  await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "low" } });
+  const { ctx, calls } = fixture();
+  const display = statusFixture(ctx);
+  display.branch.push(storedRoute("strong", "high"));
+  await display.emit("session_start", { reason: "resume" });
+  const rendered = stripVTControlCharacters(display.header!.render(200).join("\n"));
+  assert.match(rendered, /jev\/auto \(active\)/);
+  assert.match(rendered, /Thinking: automatic/);
+  assert.match(rendered, /test\/fast: low \(configured cap\)/);
+  assert.match(rendered, /test\/strong: high \(model maximum\)/);
+  assert.match(rendered, /Last dispatched: test\/strong · high/);
+  assert.doesNotMatch(rendered, /Thinking: off/);
+  assert.deepEqual(calls, []);
+  for (const width of [20, 40, 80]) {
+    const lines = display.header!.render(width);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    assert.match(stripVTControlCharacters(lines.join("")), /test\/fast/);
+  }
+});
+
+test("startup shows physical model selection as bypassing Jev", async () => {
+  const { ctx } = fixture();
+  const display = statusFixture(ctx);
+  ctx.model = fast;
+  ctx.thinkingLevel = "medium";
+  await display.emit("session_start");
+  const rendered = stripVTControlCharacters(display.header!.render(200).join("\n"));
+  assert.match(rendered, /jev\/auto \(bypassed\)/);
+  assert.match(rendered, /Selected model: test\/fast/);
+  assert.match(rendered, /Thinking: medium/);
+  assert.doesNotMatch(rendered, /Thinking: automatic/);
+});
+
+test("startup reports missing scope and candidates excluded by unsupported caps", async () => {
+  const { ctx, state } = fixture();
+  const display = statusFixture(ctx);
+  state.scoped = [];
+  await display.emit("session_start");
+  assert.match(stripVTControlCharacters(display.header!.render(200).join("\n")), /no explicit model scope/);
+  const limited = model("limited", 1, { thinkingLevelMap: { off: null, minimal: null, low: null } });
+  state.models = [limited];
+  state.scoped = [{ model: limited }];
+  await writeRouterConfig({ thinkingLevelCaps: { "test/limited": "low" } });
+  await display.emit("session_start", { reason: "reload" });
+  assert.match(stripVTControlCharacters(display.header!.render(200).join("\n")), /test\/limited: low .*excluded/);
+});
+
+test("startup reports invalid config and reload reads corrected settings", async () => {
+  await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "invalid" } });
+  const { ctx } = fixture();
+  const display = statusFixture(ctx);
+  await display.emit("session_start");
+  const failed = stripVTControlCharacters(display.header!.render(200).join("\n"));
+  assert.match(failed, /Invalid thinking-level cap for test\/fast/);
+  assert.doesNotMatch(failed, /model maximum/);
+  await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "medium" } });
+  await display.emit("session_start", { reason: "reload" });
+  display.header!.invalidate();
+  const corrected = stripVTControlCharacters(display.header!.render(200).join("\n"));
+  assert.match(corrected, /test\/fast: medium \(configured cap\)/);
+  assert.doesNotMatch(corrected, /settings unavailable|Invalid thinking-level/);
 });
 
 test("routing failures replace the pending status instead of leaving a stale pair", async () => {
