@@ -2,11 +2,9 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stripVTControlCharacters } from "node:util";
-import { visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { after, before, beforeEach, test } from "node:test";
 import type { Api, ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierResult, Message, Model, ModelsClassifierOptions } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel, ModelRouteRequest, ScopedModel, SessionEntry, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel, ModelRouteRequest, ScopedModel, SessionEntry } from "@earendil-works/pi-coding-agent";
 import extension, { route, routingContext } from "../src/jev-llm-rtr.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -115,19 +113,12 @@ function statusFixture(ctx: ExtensionContext, mode: ExtensionContext["mode"] = "
   const notifications: { message: string; type?: string }[] = [];
   const selectCalls: { title: string; options: string[] }[] = [];
   const branch: SessionEntry[] = [];
-  let header: Component | undefined;
   Object.assign(ctx, {
     mode,
     hasUI: mode === "tui" || mode === "rpc",
     model: virtual,
     sessionManager: { getBranch: () => branch },
     ui: {
-      setHeader: (factory: Parameters<ExtensionContext["ui"]["setHeader"]>[0]) => {
-        // This header uses only theme colors and never interacts with the TUI.
-        const tui = {} as TUI;
-        const theme = { fg: (_color: ThemeColor, text: string) => text } as Theme;
-        header = factory?.(tui, theme);
-      },
       setStatus: (key: string, text: string | undefined) => {
         assert.equal(key, "jev-router");
         statuses.push(text);
@@ -146,7 +137,7 @@ function statusFixture(ctx: ExtensionContext, mode: ExtensionContext["mode"] = "
       definition = value;
     },
   } as unknown as ExtensionAPI);
-  return { definition: definition!, statuses, notifications, selectCalls, commands, branch, get header() { return header; }, emit: (type: string, data = {}) => handlers.get(type)!({ type, ...data }, ctx) };
+  return { definition: definition!, statuses, notifications, selectCalls, commands, branch, emit: (type: string, data = {}) => handlers.get(type)!({ type, ...data }, ctx) };
 }
 
 function storedRoute(id: string, thinkingLevel: string, modelId = "auto"): SessionEntry {
@@ -587,7 +578,7 @@ test("JSON, print, and RPC routes do not write terminal status output", async ()
     emit("model_select", { model: fast });
     emit("session_shutdown");
     assert.deepEqual(statuses, []);
-    assert.equal(display.header, undefined);
+    assert.deepEqual(display.notifications, []);
   }
 });
 
@@ -630,38 +621,29 @@ test("invalid or unrelated router state never produces a misleading dispatch sta
   assert.deepEqual(statuses, ["Jev: awaiting prompt", "Jev: awaiting prompt"]);
 });
 
-test("startup renders configured caps, model maxima, and automatic thinking without choosing a route", async () => {
+test("startup reports current scoped caps without selecting a route or exposing model defaults and config paths", async () => {
   await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "low" } });
   const { ctx, calls } = fixture();
   const display = statusFixture(ctx);
   display.branch.push(storedRoute("strong", "high"));
   await display.emit("session_start", { reason: "resume" });
-  const rendered = stripVTControlCharacters(display.header!.render(200).join("\n"));
+  const rendered = display.notifications.at(-1)!.message;
   assert.match(rendered, /jev\/auto \(active\)/);
-  assert.match(rendered, /Thinking: automatic/);
   assert.match(rendered, /test\/fast: low \(configured cap\)/);
   assert.match(rendered, /test\/strong: high \(model maximum\)/);
   assert.match(rendered, /Last dispatched: test\/strong · high/);
-  assert.doesNotMatch(rendered, /Thinking: off/);
+  assert.doesNotMatch(rendered, /Selected model:|Thinking:|Config:|jev-llm-rtr\.json/);
   assert.deepEqual(calls, []);
-  for (const width of [20, 40, 80]) {
-    const lines = display.header!.render(width);
-    assert.ok(lines.every((line) => visibleWidth(line) <= width));
-    assert.match(stripVTControlCharacters(lines.join("")), /test\/fast/);
-  }
 });
 
-test("startup shows physical model selection as bypassing Jev", async () => {
+test("inactive startup reports only its state, even with stored routes and invalid config", async () => {
+  await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "invalid" } });
   const { ctx } = fixture();
   const display = statusFixture(ctx);
+  display.branch.push(storedRoute("strong", "high"));
   ctx.model = fast;
-  ctx.thinkingLevel = "medium";
   await display.emit("session_start");
-  const rendered = stripVTControlCharacters(display.header!.render(200).join("\n"));
-  assert.match(rendered, /jev\/auto \(bypassed\)/);
-  assert.match(rendered, /Selected model: test\/fast/);
-  assert.match(rendered, /Thinking: medium/);
-  assert.doesNotMatch(rendered, /Thinking: automatic/);
+  assert.deepEqual(display.notifications, [{ message: "Router: jev/auto (inactive)", type: "info" }]);
 });
 
 test("startup reports missing scope and candidates excluded by unsupported caps", async () => {
@@ -669,13 +651,13 @@ test("startup reports missing scope and candidates excluded by unsupported caps"
   const display = statusFixture(ctx);
   state.scoped = [];
   await display.emit("session_start");
-  assert.match(stripVTControlCharacters(display.header!.render(200).join("\n")), /no explicit model scope/);
+  assert.match(display.notifications.at(-1)!.message, /no explicit model scope/);
   const limited = model("limited", 1, { thinkingLevelMap: { off: null, minimal: null, low: null } });
   state.models = [limited];
   state.scoped = [{ model: limited }];
   await writeRouterConfig({ thinkingLevelCaps: { "test/limited": "low" } });
   await display.emit("session_start", { reason: "reload" });
-  assert.match(stripVTControlCharacters(display.header!.render(200).join("\n")), /test\/limited: low .*excluded/);
+  assert.match(display.notifications.at(-1)!.message, /test\/limited: low .*excluded/);
 });
 
 test("startup reports invalid config and reload reads corrected settings", async () => {
@@ -683,13 +665,12 @@ test("startup reports invalid config and reload reads corrected settings", async
   const { ctx } = fixture();
   const display = statusFixture(ctx);
   await display.emit("session_start");
-  const failed = stripVTControlCharacters(display.header!.render(200).join("\n"));
+  const failed = display.notifications.at(-1)!.message;
   assert.match(failed, /Invalid thinking-level cap for test\/fast/);
   assert.doesNotMatch(failed, /model maximum/);
   await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "medium" } });
   await display.emit("session_start", { reason: "reload" });
-  display.header!.invalidate();
-  const corrected = stripVTControlCharacters(display.header!.render(200).join("\n"));
+  const corrected = display.notifications.at(-1)!.message;
   assert.match(corrected, /test\/fast: medium \(configured cap\)/);
   assert.doesNotMatch(corrected, /settings unavailable|Invalid thinking-level/);
 });

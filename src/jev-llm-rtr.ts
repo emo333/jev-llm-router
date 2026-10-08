@@ -1,6 +1,5 @@
 import { clampThinkingLevel, getSupportedThinkingLevels, getSystemMessageText, type Api, type ClassifierAnswer, type ClassifierContext, type ClassifierQuestion, type Message, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { VERSION, VIRTUAL_MODEL_STATE_ENTRY, type ExtensionAPI, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { VIRTUAL_MODEL_STATE_ENTRY, type ExtensionAPI, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 import { localModelName } from "./local-model-name.ts";
 import { clampToCandidateLevels, describeThinkingCap, loadRouterConfig, routerConfigPath, saveThinkingLevelCap, thinkingLevelsForModel, type RouterConfig } from "./router-config.ts";
 
@@ -285,39 +284,23 @@ function scopedModelReport(ctx: ExtensionContext, config: RouterConfig): string 
   if (!ctx.scopedModels.length) return "Jev has no explicit model scope. Select candidates with /scoped-models.";
   const lines = scopedPhysicalModels(ctx).map((model) => `- ${model.provider}/${model.id}: ${describeThinkingCap(model, config)}`);
   if (!lines.length) lines.push("- No available physical models in the current scope.");
-  return [`Jev scoped models (highest allowed thinking level):`, ...lines, `Config: ${routerConfigPath()}`].join("\n");
+  return [`Jev scoped models (highest allowed thinking level):`, ...lines].join("\n");
 }
 
-async function showStartupHeader(ctx: ExtensionContext, lastRoute: RouteState | undefined): Promise<void> {
+async function showStartupSummary(ctx: ExtensionContext, lastRoute: RouteState | undefined): Promise<void> {
   if (ctx.mode !== "tui") return;
   const active = ctx.model?.provider === "jev" && ctx.model.id === "auto";
-  const selected = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
-  const settings = [
-    `Router: jev/auto (${active ? "active" : "bypassed"})`,
-    `Selected model: ${selected}`,
-    `Thinking: ${active ? "automatic, within scoped model caps" : ctx.thinkingLevel ?? "unknown"}`,
-  ];
-  if (lastRoute) settings.push(`Last dispatched: ${lastRoute.provider}/${lastRoute.id} · ${lastRoute.thinkingLevel}`);
-  let error: string | undefined;
-  try {
-    settings.push("", scopedModelReport(ctx, await loadRouterConfig()));
-  } catch (cause) {
-    error = cause instanceof Error ? cause.message : String(cause);
+  const lines = [`Router: jev/auto (${active ? "active" : "inactive"})`];
+  if (active) {
+    if (lastRoute) lines.push(`Last dispatched: ${lastRoute.provider}/${lastRoute.id} · ${lastRoute.thinkingLevel}`);
+    try {
+      lines.push("", scopedModelReport(ctx, await loadRouterConfig()));
+    } catch (cause) {
+      lines.push("", `Jev settings unavailable: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
   }
-  const body = settings.join("\n");
-  ctx.ui.setHeader((_tui, theme) => {
-    const text = new Text("", 0, 0);
-    const update = () => text.setText([
-      theme.fg("accent", `Pi v${VERSION} · Jev startup settings`),
-      body,
-      ...(error ? ["", theme.fg("error", `Jev settings unavailable: ${error}`)] : []),
-    ].join("\n"));
-    update();
-    return {
-      render: (width: number) => text.render(width),
-      invalidate: update,
-    };
-  });
+  // Pi's info notifications use the same dim theme color as startup resource lists.
+  ctx.ui.notify(lines.join("\n"), "info");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -332,7 +315,8 @@ export default function (pi: ExtensionAPI) {
         const config = await loadRouterConfig();
         const models = scopedPhysicalModels(ctx);
         if (!ctx.hasUI || !models.length) {
-          ctx.ui.notify(scopedModelReport(ctx, config), "info");
+          const report = scopedModelReport(ctx, config);
+          ctx.ui.notify(ctx.scopedModels.length ? `${report}\nConfig: ${routerConfigPath()}` : report, "info");
           return;
         }
 
@@ -360,7 +344,7 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("session_start", async (_event, ctx) => {
     const lastRoute = restoreStatus(ctx);
-    await showStartupHeader(ctx, lastRoute);
+    await showStartupSummary(ctx, lastRoute);
   });
   pi.on("session_tree", (_event, ctx) => {
     restoreStatus(ctx);
