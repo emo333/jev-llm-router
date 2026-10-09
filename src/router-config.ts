@@ -14,14 +14,13 @@ export interface RoutingPolicy {
   latencyUsdPerSecond: number;
   maxEscalations: number;
   historyEnabled: boolean;
-  phaseRouting: boolean;
   minimumCalibrationSamples: number;
 }
 
 const DEFAULT_POLICY: RoutingPolicy = {
   qualityThreshold: 0.967, protectedThreshold: 0.995, contextSafetyTokens: 1024,
   latencyUsdPerSecond: 0, maxEscalations: 2, historyEnabled: true,
-  phaseRouting: true, minimumCalibrationSamples: 30,
+  minimumCalibrationSamples: 30,
 };
 
 function objectSetting(value: unknown, name: string): Record<string, unknown> {

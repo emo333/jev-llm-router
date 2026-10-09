@@ -7,8 +7,7 @@ import type { Api, ClassifierAnswer, ClassifierContext, ClassifierModel, Classif
 import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel, ModelRouteRequest, ScopedModel, SessionEntry } from "@earendil-works/pi-coding-agent";
 import extension, { route } from "../src/jev-llm-rtr.ts";
 import { execCommand } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/exec.js";
-import { effectiveControls } from "../src/effective-controls.ts";
-import { calibratedProbability, loadHistory, modelKey, recordOutcome } from "../src/routing-history.ts";
+import { calibratedProbability, loadHistory } from "../src/routing-history.ts";
 import type { RouteState } from "../src/routing-types.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -247,13 +246,12 @@ test("thinking-level caps restrict classifier choices and route fallback maxima"
   assert.equal(selected.thinkingLevel, "medium");
 });
 
-test("caps clamp sticky routes to the configured maximum", async () => {
+test("fresh continuation routing respects the configured native cap", async () => {
   await writeRouterConfig({ thinkingLevelCaps: { "test/strong": "medium" } });
-  const { ctx, calls } = fixture();
+  const { ctx } = fixture({ m0: choice({ insufficient: 1 }), m1: choice({ medium: 1 }), strongest: choice({ m1: 1 }) });
   const selected = await route(request({ reason: "continuation", previous: { model: strong, thinkingLevel: "high" } }), ctx);
   assert.equal(selected.model, strong);
   assert.equal(selected.thinkingLevel, "medium");
-  assert.equal(calls.length, 0);
 });
 
 test("raises thinking to cover uncertainty between required effort levels", async () => {
@@ -325,28 +323,26 @@ test("a sole non-reasoning candidate does not require a classifier", async () =>
   assert.equal(calls.length, 0);
 });
 
-test("keeps the pair through tool continuations without another classifier call", async () => {
-  const { ctx, calls } = fixture();
-  const selected = await route(request(), ctx);
-  const continuation = await route(
-    request({
-      reason: "continuation",
-      previous: { model: selected.model, thinkingLevel: selected.thinkingLevel },
-    }),
-    ctx,
-  );
-  assert.equal(continuation.model, selected.model);
-  assert.equal(continuation.thinkingLevel, "low");
-  assert.equal(calls.length, 1);
+test("ordinary tool turns independently raise and lower model and effort for current work", async () => {
+  const { ctx, state, calls } = fixture();
+  const first = await route(request(), ctx);
+  state.response = result({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), phase: choice({ planning: 1 }) });
+  const harder = await route(request({ reason: "continuation", previous: first, state: first.state, messages: plannedExecutionMessages() }), ctx);
+  state.response = result({ m0: choice({ off: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
+  const mechanical = await route(request({ reason: "continuation", previous: harder, state: harder.state, messages: plannedExecutionMessages() }), ctx);
+  state.response = result({ m0: choice({ low: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), risk: choice({ high: 1 }) });
+  const sensitive = await route(request({ reason: "continuation", previous: mechanical, state: mechanical.state, messages: plannedExecutionMessages() }), ctx);
+  assert.deepEqual([first, harder, mechanical, sensitive].map(({ model, thinkingLevel }) => [model.id, thinkingLevel]),
+    [["fast", "low"], ["strong", "high"], ["fast", "off"], ["strong", "high"]]);
+  assert.equal(calls.length, 4);
 });
 
-test("retries prefer the failed pair over the previous successful pair", async () => {
-  const { ctx, calls } = fixture();
+test("non-availability retries reassess rather than pinning the failed model", async () => {
+  const { ctx } = fixture({ m0: choice({ medium: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
   const failed = { model: strong, thinkingLevel: "high", message: { stopReason: "error", errorMessage: "non-transient provider error" } } as ModelRouteRequest["failed"];
   const selected = await route(request({ reason: "retry", failed, previous: { model: fast, thinkingLevel: "low" } }), ctx);
-  assert.equal(selected.model, strong);
-  assert.equal(selected.thinkingLevel, "high");
-  assert.equal(calls.length, 0);
+  assert.equal(selected.model, fast);
+  assert.equal(selected.thinkingLevel, "medium");
 });
 
 test("direct requests reuse the previous physical pair", async () => {
@@ -357,12 +353,11 @@ test("direct requests reuse the previous physical pair", async () => {
   assert.equal(calls.length, 0);
 });
 
-test("stored branch state keeps a retry sticky when no physical response is available", async () => {
-  const { ctx, calls } = fixture();
+test("stored branch state cannot pin a retry without a physical response", async () => {
+  const { ctx } = fixture();
   const selected = await route(request({ reason: "retry", state: { provider: "test", id: "strong", thinkingLevel: "high" } }), ctx);
-  assert.equal(selected.model, strong);
-  assert.equal(selected.thinkingLevel, "high");
-  assert.equal(calls.length, 0);
+  assert.equal(selected.model, fast);
+  assert.equal(selected.thinkingLevel, "low");
 });
 
 test("new user prompts always reclassify, even with stored state", async () => {
@@ -639,24 +634,39 @@ function plannedExecutionMessages(): Message[] {
   ];
 }
 
-test("planning-to-execution downgrades require independently accumulated calibrated outcomes", async () => {
-  await writeRouterConfig({ classifier: { provider: "typesafe", id: "jev-1.13" }, policy: { qualityThreshold: 0.8, protectedThreshold: 0.85, minimumCalibrationSamples: 30 } });
-  const { ctx, state } = fixture({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), phase: choice({ planning: 1 }), boundedExecution: { type: "bool", probability: 0 } });
-  state.classifiers = [{ ...jev, id: "jev-1.13" }];
-  state.response.model = "jev-1.13";
+test("planning and execution switch using fresh adequacy without calibration or phase locks", async () => {
+  const { ctx, state } = fixture({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), phase: choice({ planning: 1 }) });
   const planning = await route(request(), ctx);
-  assert.equal(planning.model, strong);
-  state.response = { ...result({ m0: choice({ low: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), boundedExecution: { type: "bool", probability: 1 } }), model: "jev-1.13" };
-  const continuation = request({ reason: "continuation", previous: { model: strong, thinkingLevel: "high" }, state: planning.state, messages: plannedExecutionMessages() });
-  assert.equal((await route(continuation, ctx)).model, strong);
-  const control = effectiveControls(fast).find((entry) => entry.level === "low")!;
-  for (let i = 0; i < 40; i++) {
-    await recordOutcome({ id: `accepted-${i}`, taskId: `prior-task-${i}`, modelKey: modelKey(fast, fast.name), controlKey: control.key, family: "coding", classifierVersion: "typesafe/jev-1.13", prediction: 1, success: true, source: "user" });
-  }
-  const execution = await route(continuation, ctx);
+  state.response = result({ m0: choice({ low: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
+  const execution = await route(request({ reason: "continuation", previous: planning, state: planning.state, messages: plannedExecutionMessages() }), ctx);
   assert.equal(execution.model, fast);
   assert.equal(execution.thinkingLevel, "low");
-  assert.equal(execution.state?.phase, "execution");
+  state.response = result({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), phase: choice({ planning: 1 }) });
+  const nextPlanning = await route(request({ reason: "continuation", previous: execution, state: execution.state, messages: plannedExecutionMessages() }), ctx);
+  assert.equal(nextPlanning.model, strong);
+  assert.equal(nextPlanning.thinkingLevel, "high");
+});
+
+test("a previous high-risk phase does not pin an independently assessed mechanical turn", async () => {
+  const { ctx } = fixture();
+  const goal = { role: "user", content: "Investigate authentication correctness, then correct documentation typos.", timestamp: 0 } as const;
+  const sensitive = await route(request({ messages: [goal] }), ctx);
+  assert.equal(sensitive.model, strong);
+  const messages = plannedExecutionMessages();
+  messages[0] = goal;
+  const mechanical = await route(request({ reason: "continuation", previous: sensitive, state: sensitive.state, messages }), ctx);
+  assert.equal(mechanical.model, fast);
+  assert.equal(mechanical.thinkingLevel, "low");
+});
+
+test("long system boilerplate does not force every otherwise qualified step onto the strongest model", async () => {
+  const { ctx } = fixture();
+  const selected = await route(request({ messages: [
+    { role: "system", content: "Reference information. ".repeat(1_000), timestamp: 0 },
+    { role: "user", content: "Correct the spelling in this sentence.", timestamp: 1 },
+  ] }), ctx);
+  assert.equal(selected.model, fast);
+  assert.equal(selected.thinkingLevel, "low");
 });
 
 test("configured acceptance commands trigger bounded corrective continuation and record recovery-pair outcomes", async () => {

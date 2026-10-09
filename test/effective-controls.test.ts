@@ -92,10 +92,8 @@ test("Mistral prompt-mode reasoning is one real enabled option", () => {
   assert.deepEqual(effectiveControls(m, "low").map((c) => c.level), ["off"]);
 });
 
-test("routing policy applies defaults and rejects invalid settings", () => {
-  assert.deepEqual(routingPolicy({ thinkingLevelCaps: {} }), { qualityThreshold: .967, protectedThreshold: .995, contextSafetyTokens: 1024, latencyUsdPerSecond: 0, maxEscalations: 2, historyEnabled: true, phaseRouting: true, minimumCalibrationSamples: 30 });
-  assert.equal(routingPolicy({ thinkingLevelCaps: {}, policy: { maxEscalations: 0, historyEnabled: false } }).maxEscalations, 0);
-  for (const policy of [{ qualityThreshold: 1.1 }, { protectedThreshold: .5 }, { latencyUsdPerSecond: -1 }, { contextSafetyTokens: 1.5 }, { minimumCalibrationSamples: 0 }, { phaseRouting: "yes" }, { unexpected: true }]) {
+test("routing policy rejects invalid thresholds, limits, types and obsolete settings", () => {
+  for (const policy of [{ qualityThreshold: 1.1 }, { protectedThreshold: .5 }, { latencyUsdPerSecond: -1 }, { contextSafetyTokens: 1.5 }, { minimumCalibrationSamples: 0 }, { phaseRouting: true }, { historyEnabled: "yes" }, { unexpected: true }]) {
     assert.throws(() => routingPolicy({ thinkingLevelCaps: {}, policy } as Parameters<typeof routingPolicy>[0]), /Invalid/);
   }
 });

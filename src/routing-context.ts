@@ -1,5 +1,5 @@
 import { getSystemMessageText, type Message } from "@earendil-works/pi-ai";
-import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
+import { calculateContextTokens, estimateTokens } from "@earendil-works/pi-coding-agent";
 
 const CONTENT_BUDGET = 48_000;
 const OMISSION = "\n[...source text omitted...]\n";
@@ -8,6 +8,7 @@ const REQUIREMENT = /\b(?:must(?:\s+not)?|never|required?|requirements?|constrai
 export interface RoutingContext {
   prompt: string;
   system: string;
+  currentWork: { role: string; text: string }[];
   recent: { role: string; text: string }[];
   contextTokensEstimate: number;
   hasImages: boolean;
@@ -40,12 +41,34 @@ export function messageText(message: Message): string {
   }).join("\n");
 }
 
-/** Uses Pi's usage-aware estimator on the original transcript, not its classifier projection. */
+/** Uses Pi's public estimators on the original transcript, not its classifier projection. */
 export function requestSize(messages: readonly Message[]): { tokens: number; hasImages: boolean } {
-  return {
-    tokens: estimateContextTokens(messages).tokens,
-    hasImages: messages.some((message) => typeof message.content !== "string" && message.content.some((block) => block.type === "image")),
-  };
+  let latestPrefixTimestamp = Number.NEGATIVE_INFINITY;
+  let lastUsageIndex = -1;
+  let tokens = 0;
+  let hasImages = false;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.role === "assistant" && message.timestamp >= latestPrefixTimestamp
+      && message.stopReason !== "aborted" && message.stopReason !== "error") {
+      const usageTokens = calculateContextTokens(message.usage);
+      if (usageTokens > 0) {
+        tokens = usageTokens;
+        lastUsageIndex = i;
+      }
+    }
+    latestPrefixTimestamp = Math.max(latestPrefixTimestamp, message.timestamp);
+    if (typeof message.content !== "string" && message.content.some((block) => block.type === "image")) hasImages = true;
+  }
+  for (let i = lastUsageIndex + 1; i < messages.length; i++) {
+    const message = messages[i];
+    tokens += estimateTokens(message);
+    // The public message estimator counts added tools, but not removed schemas.
+    if (message.role === "system" && message.toolsRemoved?.length) {
+      tokens += Math.ceil(JSON.stringify(message.toolsRemoved).length / 4);
+    }
+  }
+  return { tokens, hasImages };
 }
 
 interface Excerpt { source: number; offset: number; text: string }
@@ -127,11 +150,47 @@ export function routingContext(messages: readonly Message[], size = requestSize(
   // content fields, not just prompt/system/recent, share the same character budget.
   let remaining = CONTENT_BUDGET - 1_000 - prompt.length - system.length
     - requirements.reduce((sum, text) => sum + text.length, 0) - toolFailures.reduce((sum, text) => sum + text.length, 0);
+
+  // The latest visible decision belongs to this user task, not an earlier objective.
+  // Its results share a reserved allowance before older history can consume the budget.
+  let decision = -1;
+  for (let i = messages.length - 1; i > lastUser; i--) {
+    if (messages[i].role === "assistant" && texts[i]) { decision = i; break; }
+  }
+  const workSources: number[] = decision < 0 ? [] : [decision];
+  for (let i = Math.max(lastUser, decision) + 1; i < messages.length; i++) {
+    if (messages[i].role === "toolResult") workSources.push(i);
+  }
+  const workSourceSet = new Set(workSources);
+  const workRoles = workSources.map((i) => {
+    const message = messages[i];
+    return message.role === "toolResult" ? `toolResult:${message.toolName}` : message.role;
+  });
+  const currentWork: { role: string; text: string }[] = [];
+  let workBudget = Math.min(12_000, remaining);
+  let pendingRoles = workRoles.reduce((sum, role) => sum + role.length, 0);
+  let omittedWork = 0;
+  for (let entry = 0; entry < workSources.length; entry++) {
+    const source = workSources[entry];
+    const role = workRoles[entry];
+    const textBudget = Math.max(0, workBudget - pendingRoles);
+    pendingRoles -= role.length;
+    if (workBudget < role.length) { omittedWork++; continue; }
+    const entriesLeft = workSources.length - entry;
+    const limit = source === decision
+      ? Math.min(entriesLeft > 1 ? 4_000 : 8_000, entriesLeft > 1 ? Math.ceil(textBudget / 2) : textBudget)
+      : Math.ceil(textBudget / entriesLeft);
+    const text = bounded(texts[source], limit);
+    currentWork.push({ role, text });
+    workBudget -= role.length + text.length;
+    remaining -= role.length + text.length;
+    if (text.length < texts[source].length) omittedWork++;
+  }
   const recent: { role: string; text: string }[] = [];
   let omittedMessages = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
-    if (i === lastUser || message.role === "system" || !texts[i]) continue;
+    if (i === lastUser || message.role === "system" || workSourceSet.has(i) || !texts[i]) continue;
     const role = message.role === "toolResult" ? `toolResult:${message.toolName}` : message.role;
     if (remaining <= role.length) { omissions.recent = true; omittedMessages++; continue; }
     const text = bounded(texts[i], Math.min(8_000, remaining - role.length));
@@ -139,6 +198,6 @@ export function routingContext(messages: readonly Message[], size = requestSize(
     remaining -= role.length + text.length;
     if (text.length < texts[i].length) { omissions.recent = true; omittedMessages++; }
   }
-  const projectionNote = `Visible text only; total content budget ${CONTENT_BUDGET} characters. Omitted source text: prompt=${omissions.prompt}, system=${omissions.system}, recent=${omissions.recent} (${omittedMessages} messages wholly or partly omitted); ${omittedFailures} tool failures wholly or partly omitted. Requirements are source excerpts, not a complete task specification. Images and hidden reasoning are not transmitted; request size uses Pi's full-transcript usage estimator.`;
-  return { prompt, system, recent, contextTokensEstimate: size.tokens, hasImages: size.hasImages, projectionNote, omissions, requirements, toolFailures };
+  const projectionNote = `Visible text only; total content budget ${CONTENT_BUDGET} characters. Omitted source text: prompt=${omissions.prompt}, system=${omissions.system}, currentWork=${omittedWork} messages wholly or partly omitted, recent=${omissions.recent} (${omittedMessages} messages wholly or partly omitted); ${omittedFailures} tool failures wholly or partly omitted. Requirements are source excerpts, not a complete task specification. Images and hidden reasoning are not transmitted; request size uses Pi's full-transcript usage estimator.`;
+  return { prompt, system, currentWork, recent, contextTokensEstimate: size.tokens, hasImages: size.hasImages, projectionNote, omissions, requirements, toolFailures };
 }
