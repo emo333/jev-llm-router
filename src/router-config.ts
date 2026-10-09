@@ -1,13 +1,73 @@
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
-import { getSupportedThinkingLevels, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { effectiveControls } from "./effective-controls.ts";
 
 const THINKING_LEVELS: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+export interface RoutingPolicy {
+  qualityThreshold: number;
+  protectedThreshold: number;
+  contextSafetyTokens: number;
+  latencyUsdPerSecond: number;
+  maxEscalations: number;
+  historyEnabled: boolean;
+  phaseRouting: boolean;
+  minimumCalibrationSamples: number;
+}
+
+const DEFAULT_POLICY: RoutingPolicy = {
+  qualityThreshold: 0.967, protectedThreshold: 0.995, contextSafetyTokens: 1024,
+  latencyUsdPerSecond: 0, maxEscalations: 2, historyEnabled: true,
+  phaseRouting: true, minimumCalibrationSamples: 30,
+};
+
+function objectSetting(value: unknown, name: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid Jev router setting "${name}": expected an object.`);
+  return value as Record<string, unknown>;
+}
+
+export function routingPolicy(config: RouterConfig): RoutingPolicy {
+  const raw = config.policy === undefined ? {} : objectSetting(config.policy, "policy");
+  const policy = { ...DEFAULT_POLICY };
+  for (const key of Object.keys(raw)) {
+    if (!Object.hasOwn(DEFAULT_POLICY, key)) throw new Error(`Invalid Jev router policy setting "${key}".`);
+    const field = key as keyof RoutingPolicy;
+    const value = raw[key];
+    if (typeof DEFAULT_POLICY[field] === "boolean") {
+      if (typeof value !== "boolean") throw new Error(`Invalid Jev router policy "${key}": expected a boolean.`);
+    } else {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error(`Invalid Jev router policy "${key}": expected a finite nonnegative number.`);
+      if ((key === "qualityThreshold" || key === "protectedThreshold") && (value <= 0 || value > 1)) throw new Error(`Invalid Jev router policy "${key}": expected a probability in (0, 1].`);
+      if (["contextSafetyTokens", "maxEscalations", "minimumCalibrationSamples"].includes(key) && !Number.isSafeInteger(value)) throw new Error(`Invalid Jev router policy "${key}": expected a nonnegative safe integer.`);
+      if (key === "minimumCalibrationSamples" && value === 0) throw new Error(`Invalid Jev router policy "${key}": expected a positive integer.`);
+    }
+    Object.assign(policy, { [key]: value });
+  }
+  if (policy.protectedThreshold < policy.qualityThreshold) throw new Error("Invalid Jev router policy: protectedThreshold must be at least qualityThreshold.");
+  return policy;
+}
+
+function validateFeatures(config: RouterConfig): void {
+  routingPolicy(config);
+  if (config.classifier !== undefined) {
+    const classifier = objectSetting(config.classifier, "classifier");
+    for (const key of ["provider", "id"]) if (typeof classifier[key] !== "string" || !(classifier[key] as string).trim()) throw new Error(`Invalid Jev router classifier "${key}": expected a nonempty string.`);
+  }
+  if (config.verification !== undefined) {
+    const verification = objectSetting(config.verification, "verification");
+    if (typeof verification.command !== "string" || !verification.command.trim()) throw new Error("Invalid Jev router verification command: expected a nonempty string.");
+    for (const key of ["timeoutMs", "maxAttempts"]) if (typeof verification[key] !== "number" || !Number.isSafeInteger(verification[key]) || (verification[key] as number) <= 0) throw new Error(`Invalid Jev router verification "${key}": expected a positive safe integer.`);
+  }
+}
+
 export interface RouterConfig {
   thinkingLevelCaps: Record<string, ModelThinkingLevel>;
+  policy?: Partial<RoutingPolicy>;
+  classifier?: { provider: string; id: string };
+  verification?: { command: string; timeoutMs: number; maxAttempts: number };
   [key: string]: unknown;
 }
 
@@ -36,6 +96,7 @@ export async function loadRouterConfig(path = routerConfigPath()): Promise<Route
   }
   const raw = parsed as Record<string, unknown>;
   const caps = raw.thinkingLevelCaps;
+  validateFeatures({ ...raw, thinkingLevelCaps: {} } as RouterConfig);
   if (caps === undefined) return { ...raw, thinkingLevelCaps: {} };
   if (!caps || typeof caps !== "object" || Array.isArray(caps)) {
     throw new Error(`Invalid Jev router config at ${path}: "thinkingLevelCaps" must be an object.`);
@@ -70,15 +131,12 @@ export async function saveThinkingLevelCap(modelKey: string, level: ModelThinkin
 }
 
 export function thinkingLevelsForModel(model: Model<Api>, config: RouterConfig): ModelThinkingLevel[] {
-  const levels = getSupportedThinkingLevels(model);
   const cap = config.thinkingLevelCaps[`${model.provider}/${model.id}`];
-  if (cap === undefined) return levels;
-  const capIndex = THINKING_LEVELS.indexOf(cap);
-  return levels.filter((level) => THINKING_LEVELS.indexOf(level) <= capIndex);
+  return effectiveControls(model, cap).map((control) => control.level);
 }
 
 export function describeThinkingCap(model: Model<Api>, config: RouterConfig): string {
-  const supported = getSupportedThinkingLevels(model);
+  const supported = effectiveControls(model).map((control) => control.level);
   const cap = config.thinkingLevelCaps[`${model.provider}/${model.id}`];
   if (cap === undefined) return `${supported.at(-1) ?? "off"} (model maximum)`;
 

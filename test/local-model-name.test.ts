@@ -34,7 +34,8 @@ function localModel(overrides: Partial<Model<Api>> = {}): Model<Api> {
   };
 }
 
-function fixture(models = [localModel()]) {
+function fixture(models = [localModel()], forceClassification = false) {
+  if (forceClassification) models = [...models, localModel({ provider: "remote", id: "remote-spare", name: "remote-spare", api: "anthropic-messages", baseUrl: "https://example.invalid", cost: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0 } })];
   const calls: ClassifierContext[] = [];
   const ctx = {
     scopedModels: models.map((model) => ({ model })),
@@ -49,6 +50,12 @@ function fixture(models = [localModel()]) {
           answers: Object.fromEntries([
             ...models.map((_, i) => [`m${i}`, { type: "choice", choice: "off", probabilities: { off: 1 } }]),
             ["strongest", { type: "choice", choice: "m0", probabilities: { m0: 1 } }],
+            ["taskFamily", { type: "choice", choice: "coding", probabilities: { coding: 1 } }],
+            ["risk", { type: "choice", choice: "low", probabilities: { low: 1 } }],
+            ["verifiable", { type: "bool", probability: .99 }],
+            ["boundedExecution", { type: "bool", probability: 0 }],
+            ["phase", { type: "choice", choice: "execution", probabilities: { execution: 1 } }],
+            ["outputLength", { type: "choice", choice: "normal", probabilities: { normal: 1 } }],
           ]),
         };
       },
@@ -70,7 +77,7 @@ const signal = () => new AbortController().signal;
 
 test("local API names reach Jev's metadata and strongest question without changing dispatch", async (t) => {
   const local = Object.freeze(localModel({ baseUrl: "http://albert.bamf:8081/v1" }));
-  const { ctx, calls } = fixture([local]);
+  const { ctx, calls } = fixture([local], true);
   t.mock.method(dns, "lookup", async (hostname: string) => {
     assert.equal(hostname, "albert.bamf");
     return [{ address: "10.0.0.230", family: 4 }];
@@ -106,19 +113,21 @@ test("local discovery matches IDs and aliases instead of choosing the first serv
   assert.deepEqual((calls[0].state.candidates as { name: string }[]).map((m) => m.name), ["Qwen3.6-27B-Q4_K_M", "Qwen3.6-35B-A3B-Q4_K_M"]);
 });
 
-test("local discovery refreshes on new prompts but not sticky follow-ups", async (t) => {
-  const { ctx, calls } = fixture();
+test("local discovery caches nearby prompts and refreshes after its short TTL", async (t) => {
+  const { ctx, calls } = fixture(undefined, true);
+  let now = 1_000;
+  t.mock.method(Date, "now", () => now);
   let name = "first-model";
   const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [{ id: name }] }));
   const selected = await route(request(), ctx);
   name = "replacement-model";
-  for (const reason of ["continuation", "retry", "direct"] as const) {
-    await route(request({ reason, previous: selected }), ctx);
-  }
+  await route(request({ previous: selected }), ctx);
   assert.equal(fetch.mock.callCount(), 1);
+  assert.equal((calls[1].state.candidates as { name: string }[])[0].name, "first-model");
+  now += 30_001;
   await route(request({ previous: selected }), ctx);
   assert.equal(fetch.mock.callCount(), 2);
-  assert.equal((calls[1].state.candidates as { name: string }[])[0].name, name);
+  assert.equal((calls[2].state.candidates as { name: string }[])[0].name, name);
 });
 
 test("local discovery leaves public endpoints alone, even with zero catalog cost", async (t) => {
@@ -177,7 +186,7 @@ test("local discovery falls back for missing, malformed, or ambiguous model list
 });
 
 test("local discovery failure does not prevent routing with the configured name", async (t) => {
-  const { ctx, calls } = fixture();
+  const { ctx, calls } = fixture(undefined, true);
   for (const response of [new Response("denied", { status: 401 }), new Response("unavailable", { status: 503 }), new Response("not json"), new Response(null, { status: 302, headers: { Location: "https://example.com" } })]) {
     const fetch = t.mock.method(globalThis, "fetch", async () => response);
     await route(request(), ctx);
@@ -223,7 +232,7 @@ test("local discovery timeout bounds waits for DNS, authentication, and HTTP", a
 });
 
 test("cancellation during local discovery stops routing before Jev", async (t) => {
-  const { ctx, calls } = fixture();
+  const { ctx, calls } = fixture(undefined, true);
   const controller = new AbortController();
   t.mock.method(globalThis, "fetch", async () => {
     controller.abort();
@@ -234,13 +243,166 @@ test("cancellation during local discovery stops routing before Jev", async (t) =
 });
 
 test("local discovery never queries models outside the available scope", async (t) => {
-  const { ctx, models } = fixture([localModel(), localModel({ id: "unscoped", baseUrl: "http://127.0.0.1:8082/v1" })]);
+  const { ctx, models } = fixture([localModel(), localModel({ id: "unscoped", baseUrl: "http://127.0.0.1:8082/v1" })], true);
   const unavailable = localModel({ id: "unavailable", baseUrl: "http://127.0.0.1:8083/v1" });
-  Object.assign(ctx, { scopedModels: [{ model: models[0] }, { model: unavailable }] });
+  Object.assign(ctx, { scopedModels: [{ model: models[0] }, { model: models[2] }, { model: unavailable }] });
   const fetch = t.mock.method(globalThis, "fetch", async (url: URL) => {
     assert.equal(url.port, "8081");
     return Response.json({ data: [{ id: "actual-model" }] });
   });
   await route(request(), ctx);
   assert.equal(fetch.mock.callCount(), 1);
+});
+
+test("discovery cache is registry-local and reuses identical native configurations", async (t) => {
+  const first = fixture();
+  const second = fixture();
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [{ id: "native-model" }] }));
+  assert.equal(await localModelName(first.models[0], first.ctx.modelRegistry, signal()), "native-model");
+  assert.equal(await localModelName(localModel(), first.ctx.modelRegistry, signal()), "native-model");
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(await localModelName(second.models[0], second.ctx.modelRegistry, signal()), "native-model");
+  assert.equal(fetch.mock.callCount(), 2);
+});
+
+test("changed native model metadata invalidates discovery identity", async (t) => {
+  const { ctx, models } = fixture();
+  let discovered = "first-native";
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [{ id: discovered }] }));
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), discovered);
+  discovered = "changed-native";
+  models[0].name = "changed-display-name";
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), discovered);
+  models[0].contextWindow = 65_536;
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), discovered);
+  models[0].baseUrl = "http://127.0.0.1:8082/v1";
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), discovered);
+  models[0].headers = { "X-Configuration": "changed" };
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), discovered);
+  assert.equal(fetch.mock.callCount(), 5);
+});
+
+test("effective endpoint and authentication changes cannot reuse stale discovery", async (t) => {
+  const { ctx, models } = fixture();
+  let endpoint = "http://127.0.0.1:8081/v1";
+  let apiKey = "first-secret";
+  t.mock.method(ctx.modelRegistry, "getApiKeyAndHeaders", async () => ({ ok: true, baseUrl: endpoint, apiKey }));
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [{ id: `native-${apiKey}` }] }));
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), "native-first-secret");
+  endpoint = "http://127.0.0.1:8082/v1";
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), "native-first-secret");
+  apiKey = "second-secret";
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), "native-second-secret");
+  endpoint = "https://203.0.113.7/v1";
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), models[0].name);
+  assert.equal(fetch.mock.callCount(), 3);
+});
+
+test("concurrent discovery shares work while each caller retains cancellation", async (t) => {
+  const { ctx, models } = fixture();
+  const entered = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<Response>();
+  let lookupSignal: AbortSignal | undefined;
+  const fetch = t.mock.method(globalThis, "fetch", async (_url: URL, options: RequestInit) => {
+    lookupSignal = options.signal!;
+    entered.resolve();
+    return response.promise;
+  });
+  const first = new AbortController();
+  const firstLookup = localModelName(models[0], ctx.modelRegistry, first.signal);
+  const secondLookup = localModelName(models[0], ctx.modelRegistry, signal());
+  await entered.promise;
+  first.abort();
+  await assert.rejects(firstLookup, { name: "AbortError" });
+  assert.equal(lookupSignal!.aborted, false);
+  response.resolve(Response.json({ data: [{ id: "shared-native" }] }));
+  assert.equal(await secondLookup, "shared-native");
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), "shared-native");
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test("canceling all subscribers aborts discovery without caching its result", async (t) => {
+  const { ctx, models } = fixture();
+  const entered = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<Response>();
+  let fetchSignal: AbortSignal | undefined;
+  let requests = 0;
+  const fetch = t.mock.method(globalThis, "fetch", async (_url: URL, options: RequestInit) => {
+    if (++requests > 1) return Response.json({ data: [{ id: "fresh-native" }] });
+    fetchSignal = options.signal!;
+    fetchSignal.addEventListener("abort", () => response.reject(fetchSignal!.reason), { once: true });
+    entered.resolve();
+    return response.promise;
+  });
+  const first = new AbortController();
+  const second = new AbortController();
+  const firstLookup = localModelName(models[0], ctx.modelRegistry, first.signal);
+  const secondLookup = localModelName(models[0], ctx.modelRegistry, second.signal);
+  await entered.promise;
+  first.abort();
+  second.abort();
+  await Promise.all([assert.rejects(firstLookup, { name: "AbortError" }), assert.rejects(secondLookup, { name: "AbortError" })]);
+  assert.equal(fetchSignal!.aborted, true);
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), "fresh-native");
+  assert.equal(fetch.mock.callCount(), 2);
+});
+
+test("pre-aborted callers cannot use a cached result", async (t) => {
+  const { ctx, models } = fixture();
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [{ id: "native-model" }] }));
+  await localModelName(models[0], ctx.modelRegistry, signal());
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(localModelName(models[0], ctx.modelRegistry, controller.signal), { name: "AbortError" });
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test("discovery cache evicts old entries instead of growing without bound", async (t) => {
+  const { ctx } = fixture();
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [{ id: "native-model" }] }));
+  for (let i = 0; i < 65; i++) {
+    await localModelName(localModel({ id: `alias-${i}` }), ctx.modelRegistry, signal());
+  }
+  assert.equal(fetch.mock.callCount(), 65);
+  await localModelName(localModel({ id: "alias-0" }), ctx.modelRegistry, signal());
+  assert.equal(fetch.mock.callCount(), 66);
+});
+
+test("metadata changed during an in-flight discovery cannot receive its stale name", async (t) => {
+  const { ctx, models } = fixture();
+  const entered = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<Response>();
+  let count = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    count++;
+    if (count > 1) return Response.json({ data: [{ id: "new-native" }] });
+    entered.resolve();
+    return response.promise;
+  });
+  const lookup = localModelName(models[0], ctx.modelRegistry, signal());
+  await entered.promise;
+  models[0].baseUrl = "http://127.0.0.1:8082/v1";
+  response.resolve(Response.json({ data: [{ id: "stale-native" }] }));
+  assert.equal(await lookup, models[0].name);
+  assert.equal(await localModelName(models[0], ctx.modelRegistry, signal()), "new-native");
+});
+
+test("discovery bounds simultaneous flights without queuing more work", async (t) => {
+  const { ctx } = fixture();
+  const entered = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<void>();
+  let requests = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    if (++requests === 64) entered.resolve();
+    await response.promise;
+    return Response.json({ data: [{ id: "native-model" }] });
+  });
+  const lookups = Array.from({ length: 64 }, (_, i) => localModelName(localModel({ id: `alias-${i}` }), ctx.modelRegistry, signal()));
+  const overflow = localModel({ id: "overflow" });
+  assert.equal(await localModelName(overflow, ctx.modelRegistry, signal()), overflow.name);
+  await entered.promise;
+  assert.equal(requests, 64);
+  response.resolve();
+  assert.ok((await Promise.all(lookups)).every((name) => name === "native-model"));
 });

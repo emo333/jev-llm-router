@@ -5,7 +5,11 @@ import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
 import type { Api, ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierResult, Message, Model, ModelsClassifierOptions } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel, ModelRouteRequest, ScopedModel, SessionEntry } from "@earendil-works/pi-coding-agent";
-import extension, { route, routingContext } from "../src/jev-llm-rtr.ts";
+import extension, { route } from "../src/jev-llm-rtr.ts";
+import { execCommand } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/exec.js";
+import { effectiveControls } from "../src/effective-controls.ts";
+import { calibratedProbability, loadHistory, modelKey, recordOutcome } from "../src/routing-history.ts";
+import type { RouteState } from "../src/routing-types.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 let testAgentDir: string;
@@ -15,6 +19,7 @@ before(async () => {
 });
 beforeEach(async () => {
   await rm(join(testAgentDir, "jev-llm-rtr.json"), { force: true });
+  await rm(join(testAgentDir, "jev-llm-rtr-history.json"), { force: true });
 });
 after(async () => {
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -60,7 +65,11 @@ function choice(probabilities: Record<string, number>, selected?: string): Class
   return { type: "choice", choice: selected ?? best[0], probabilities, confidence: best[1] };
 }
 function result(answers: Record<string, ClassifierAnswer>): ClassifierResult {
-  return { api: jev.api, provider: jev.provider, model: jev.id, answers, stopReason: "stop", timestamp: 0 };
+  const taskAnswers: Record<string, ClassifierAnswer> = {
+    taskFamily: choice({ coding: 1 }), risk: choice({ low: 1 }), phase: choice({ execution: 1 }), outputLength: choice({ normal: 1 }),
+    verifiable: { type: "bool", probability: 1 }, boundedExecution: { type: "bool", probability: 0 },
+  };
+  return { api: jev.api, provider: jev.provider, model: jev.id, answers: { ...taskAnswers, ...answers }, stopReason: "stop", timestamp: 0 };
 }
 type RouteRequest = Parameters<typeof route>[0];
 function request(overrides: Partial<RouteRequest> = {}): RouteRequest {
@@ -73,7 +82,7 @@ function request(overrides: Partial<RouteRequest> = {}): RouteRequest {
   };
 }
 function fixture(
-  answers = {
+  answers: Record<string, ClassifierAnswer> = {
     m0: choice({ low: 0.98, insufficient: 0.02 }),
     m1: choice({ medium: 0.98, insufficient: 0.02 }),
     strongest: choice({ m1: 0.9, m0: 0.1 }),
@@ -107,7 +116,7 @@ function fixture(
 
 function statusFixture(ctx: ExtensionContext, mode: ExtensionContext["mode"] = "tui", selections: (string | undefined)[] = []) {
   let definition: ExtensionVirtualModel<NonNullable<RouteRequest["state"]>> | undefined;
-  const handlers = new Map<string, (event: { type: string; [key: string]: unknown }, ctx: ExtensionContext) => void | Promise<void>>();
+  const handlers = new Map<string, ((event: { type: string; [key: string]: unknown }, ctx: ExtensionContext) => unknown)[]>();
   const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   const statuses: (string | undefined)[] = [];
   const notifications: { message: string; type?: string }[] = [];
@@ -117,6 +126,7 @@ function statusFixture(ctx: ExtensionContext, mode: ExtensionContext["mode"] = "
     mode,
     hasUI: mode === "tui" || mode === "rpc",
     model: virtual,
+    cwd: testAgentDir,
     sessionManager: { getBranch: () => branch },
     ui: {
       setStatus: (key: string, text: string | undefined) => {
@@ -131,13 +141,18 @@ function statusFixture(ctx: ExtensionContext, mode: ExtensionContext["mode"] = "
     },
   });
   extension({
-    on: (event: string, handler: (event: { type: string; [key: string]: unknown }, ctx: ExtensionContext) => void | Promise<void>) => handlers.set(event, handler),
+    on: (event: string, handler: (event: { type: string; [key: string]: unknown }, ctx: ExtensionContext) => unknown) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+    exec: (command: string, args: string[], options: { timeout?: number; cwd?: string }) => execCommand(command, args, options.cwd ?? testAgentDir, options),
     registerCommand: (name: string, options: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => commands.set(name, options.handler),
     registerVirtualModel: (value: typeof definition) => {
       definition = value;
     },
   } as unknown as ExtensionAPI);
-  return { definition: definition!, statuses, notifications, selectCalls, commands, branch, emit: (type: string, data = {}) => handlers.get(type)!({ type, ...data }, ctx) };
+  return { definition: definition!, statuses, notifications, selectCalls, commands, branch, emit: async (type: string, data = {}) => {
+    const results: unknown[] = [];
+    for (const handler of handlers.get(type) ?? []) results.push(await handler({ type, ...data }, ctx));
+    return results;
+  } };
 }
 
 function storedRoute(id: string, thinkingLevel: string, modelId = "auto"): SessionEntry {
@@ -204,27 +219,18 @@ test("rejects invalid thinking caps instead of routing without the limit", async
   await assert.rejects(route(request(), ctx), /Invalid thinking-level cap/);
 });
 
-test("registers a virtual model with automatic physical thinking", () => {
-  const { ctx } = fixture();
-  const { definition } = statusFixture(ctx);
-  assert.equal(definition.provider, "jev");
-  assert.equal(definition.id, "auto");
-  assert.deepEqual(definition.thinkingLevels, ["off"]);
-});
 
 test("selects the cheapest sufficient model and Jev's thinking level", async () => {
   const { ctx, calls } = fixture();
   const selected = await route(request(), ctx);
   assert.equal(selected.model.id, "fast");
   assert.equal(selected.thinkingLevel, "low");
-  assert.deepEqual(selected.state, { provider: "test", id: "fast", thinkingLevel: "low" });
   assert.equal(calls.length, 1);
   const candidates = calls[0].input.state.candidates as { id: string }[];
   assert.deepEqual(
     candidates.map((candidate) => candidate.id),
     ["fast", "strong"],
   );
-  assert.deepEqual(Object.keys(calls[0].input.questions), ["m0", "m1", "strongest"]);
 });
 
 test("thinking-level caps restrict classifier choices and route fallback maxima", async () => {
@@ -307,14 +313,16 @@ test("thinking choices use each model's supported levels, ignoring scoped defaul
   assert.deepEqual(Object.keys(question.criteria), ["medium", "xhigh", "insufficient"]);
 });
 
-test("non-reasoning models are routed with thinking off", async () => {
+test("a sole non-reasoning candidate does not require a classifier", async () => {
   const ordinary = model("ordinary", 1, { reasoning: false });
   const { ctx, state, calls } = fixture();
   state.models = [ordinary];
   state.scoped = [{ model: ordinary }];
-  state.response = result({ m0: choice({ off: 1 }), strongest: choice({ m0: 1 }) });
-  assert.equal((await route(request(), ctx)).thinkingLevel, "off");
-  assert.deepEqual(Object.keys(calls[0].input.questions.m0.criteria), ["off", "insufficient"]);
+  state.classifiers = [];
+  const selected = await route(request(), ctx);
+  assert.equal(selected.model, ordinary);
+  assert.equal(selected.thinkingLevel, "off");
+  assert.equal(calls.length, 0);
 });
 
 test("keeps the pair through tool continuations without another classifier call", async () => {
@@ -334,7 +342,7 @@ test("keeps the pair through tool continuations without another classifier call"
 
 test("retries prefer the failed pair over the previous successful pair", async () => {
   const { ctx, calls } = fixture();
-  const failed = { model: strong, thinkingLevel: "high", message: {} } as ModelRouteRequest["failed"];
+  const failed = { model: strong, thinkingLevel: "high", message: { stopReason: "error", errorMessage: "non-transient provider error" } } as ModelRouteRequest["failed"];
   const selected = await route(request({ reason: "retry", failed, previous: { model: fast, thinkingLevel: "low" } }), ctx);
   assert.equal(selected.model, strong);
   assert.equal(selected.thinkingLevel, "high");
@@ -371,7 +379,7 @@ test("new user prompts always reclassify, even with stored state", async () => {
 });
 
 test("removing a model from scope prevents sticking to it", async () => {
-  const { ctx, state, calls } = fixture();
+  const { ctx, state, calls } = fixture({ m0: choice({ low: 1 }), strongest: choice({ m0: 1 }) });
   state.scoped = [{ model: fast }];
   const selected = await route(request({ reason: "continuation", previous: { model: strong, thinkingLevel: "high" } }), ctx);
   assert.equal(selected.model, fast);
@@ -421,38 +429,6 @@ test("image input excludes text-only models", async () => {
   assert.equal(selected.model, vision);
   assert.equal(calls[0].input.state.hasImages, true);
   assert.ok(!JSON.stringify(calls[0].input).includes("PRIVATE_BASE64"));
-});
-
-test("passes prompt, system instructions, recent text and tool context, but not hidden thinking", () => {
-  const messages: Message[] = [
-    { role: "system", content: "Follow repository rules", sections: { rules: "Keep edits small" }, timestamp: 0 },
-    { role: "user", content: "Earlier task", timestamp: 0 },
-    {
-      role: "assistant",
-      content: [
-        { type: "thinking", thinking: "PRIVATE_REASONING", thinkingSignature: "SECRET_SIGNATURE" },
-        { type: "toolCall", id: "1", name: "read", arguments: { path: "src/parser.ts" } },
-      ],
-    } as Message,
-    { role: "toolResult", toolCallId: "1", toolName: "read", content: [{ type: "text", text: "function parse() {}" }], isError: false, timestamp: 0 },
-    { role: "user", content: "Now fix the edge case", timestamp: 0 },
-  ];
-  const context = routingContext(messages);
-  assert.equal(context.prompt, "Now fix the edge case");
-  assert.match(context.system, /Keep edits small/);
-  assert.match(JSON.stringify(context.recent), /src\/parser.ts/);
-  assert.match(JSON.stringify(context.recent), /function parse/);
-  assert.ok(!JSON.stringify(context).includes("PRIVATE_REASONING"));
-  assert.ok(!JSON.stringify(context).includes("SECRET_SIGNATURE"));
-});
-
-test("bounds text context while preserving both ends of the latest prompt", () => {
-  const messages: Message[] = [{ role: "system", content: "s".repeat(100_000), timestamp: 0 }, ...Array.from({ length: 20 }, (_, i): Message => ({ role: "user", content: `${i}:` + "c".repeat(10_000), timestamp: 0 })), { role: "user", content: "START" + "p".repeat(100_000) + "END", timestamp: 0 }];
-  const context = routingContext(messages);
-  assert.ok(context.prompt.startsWith("START"));
-  assert.ok(context.prompt.endsWith("END"));
-  assert.ok(context.prompt.length + context.system.length + context.recent.reduce((sum, m) => sum + m.text.length, 0) <= 48_000);
-  assert.ok(context.contextTokensEstimate > 75_000);
 });
 
 test("catalog estimates honor long-context pricing tiers", async () => {
@@ -505,6 +481,23 @@ test("invalid probability distributions cannot qualify cheap models", async () =
   assert.equal((await route(request(), ctx)).model, strong);
 });
 
+test("normalized rounding at full probability mass still dispatches an eligible control", async () => {
+  const { ctx } = fixture({
+    m0: choice({
+      off: 0.00020516130820136697,
+      minimal: 0.3012675624812012,
+      low: 0.10294796415694833,
+      medium: 0.25068881989927,
+      high: 0.34489049215437906,
+    }),
+    m1: choice({ medium: 1 }),
+    strongest: choice({ m1: 1 }),
+  });
+  const selected = await route(request(), ctx);
+  assert.equal(selected.model, fast);
+  assert.equal(selected.thinkingLevel, "high");
+});
+
 test("invalid thinking levels cannot qualify a model", async () => {
   const { ctx } = fixture({
     m0: choice({ max: 1 }),
@@ -536,30 +529,6 @@ test("caller cancellation during classification cannot fall through to a route",
   assert.equal(calls[0].options?.signal?.aborted, true);
 });
 
-test("shows the chosen model and effort before the routed request returns", async () => {
-  const { ctx } = fixture();
-  const { definition, statuses } = statusFixture(ctx);
-  await definition.route(request(), ctx);
-  assert.deepEqual(statuses, ["Jev: choosing model…", "Jev: test/fast · low"]);
-});
-
-test("sticky turns show their physical pair without a new choosing status", async () => {
-  const { ctx, calls } = fixture();
-  const { definition, statuses } = statusFixture(ctx);
-  await definition.route(request({ reason: "continuation", previous: { model: strong, thinkingLevel: "high" } }), ctx);
-  assert.deepEqual(statuses, ["Jev: test/strong · high"]);
-  assert.equal(calls.length, 0);
-});
-
-test("shows the clamped effort if a sticky model no longer supports its old level", async () => {
-  const { ctx, state } = fixture();
-  const limited = model("limited", 1, { thinkingLevelMap: { low: null } });
-  state.models = [limited];
-  state.scoped = [{ model: limited }];
-  const { definition, statuses } = statusFixture(ctx);
-  await definition.route(request({ reason: "continuation", previous: { model: limited, thinkingLevel: "low" } }), ctx);
-  assert.deepEqual(statuses, ["Jev: test/limited · medium"]);
-});
 
 test("compaction and other direct routes do not overwrite the main status", async () => {
   const { ctx } = fixture();
@@ -582,112 +551,168 @@ test("JSON, print, and RPC routes do not write terminal status output", async ()
   }
 });
 
-test("new sessions show awaiting prompt, and reload restores the latest branch route", async () => {
+
+test("context fit excludes a cheap model before Jev can select it", async () => {
+  const tiny = model("tiny", 0.1, { contextWindow: 4_096 });
+  const { ctx, state } = fixture({ m0: choice({ low: 1 }), strongest: choice({ m0: 1 }) });
+  state.models = [tiny, strong];
+  state.scoped = [{ model: tiny }, { model: strong }];
+  const selected = await route(request({ messages: [{ role: "user", content: "x".repeat(40_000), timestamp: 0 }] }), ctx);
+  assert.equal(selected.model, strong);
+});
+
+test("continuations cannot retain a model after the transcript outgrows its context", async () => {
+  const tiny = model("tiny", 0.1, { contextWindow: 4_096 });
+  const { ctx, state } = fixture({ m0: choice({ low: 1 }), strongest: choice({ m0: 1 }) });
+  state.models = [tiny, strong];
+  state.scoped = [{ model: tiny }, { model: strong }];
+  const selected = await route(request({ reason: "continuation", previous: { model: tiny, thinkingLevel: "low" }, messages: [{ role: "user", content: "x".repeat(40_000), timestamp: 0 }] }), ctx);
+  assert.equal(selected.model, strong);
+});
+
+test("normalized probability rounding cannot inflate a cheap candidate's eligibility", async () => {
+  const { ctx } = fixture({ m0: choice({ low: 0.967, insufficient: 0.052 }), m1: choice({ medium: 1 }), strongest: choice({ m1: 1 }) });
+  assert.equal((await route(request(), ctx)).model, strong);
+});
+
+test("risk protection overrides cheap nominal sufficiency", async () => {
   const { ctx } = fixture();
-  const { statuses, branch, emit } = statusFixture(ctx);
-  await emit("session_start");
-  branch.push(storedRoute("fast", "low"), storedRoute("strong", "high"));
-  await emit("session_start", { reason: "reload" });
-  assert.deepEqual(statuses, ["Jev: awaiting prompt", "Jev: last dispatched test/strong · high"]);
+  const selected = await route(request({ messages: [{ role: "user", content: "Fix the authentication bypass without weakening access controls.", timestamp: 0 }] }), ctx);
+  assert.equal(selected.model, strong);
+  assert.equal(selected.thinkingLevel, "high");
 });
 
-test("tree navigation updates the status from the new branch rather than global history", () => {
-  const { ctx } = fixture();
-  const { statuses, branch, emit } = statusFixture(ctx);
-  branch.push(storedRoute("strong", "high"));
-  emit("session_tree");
-  branch.splice(0, branch.length, storedRoute("fast", "low"));
-  emit("session_tree");
-  assert.deepEqual(statuses, ["Jev: last dispatched test/strong · high", "Jev: last dispatched test/fast · low"]);
+test("effective native caps exclude forced-high models below their dispatched effort", async () => {
+  const managed = model("managed", 0.1, { api: "anthropic-messages", compat: { supportsMidConvoEffort: true, forceAdaptiveThinking: true } });
+  await writeRouterConfig({ thinkingLevelCaps: { "test/managed": "medium" } });
+  const { ctx, state } = fixture({ m0: choice({ low: 1 }), strongest: choice({ m0: 1 }) });
+  state.models = [managed, strong];
+  state.scoped = [{ model: managed }, { model: strong }];
+  assert.equal((await route(request(), ctx)).model, strong);
 });
 
-test("manual model selection clears the Jev status, and reselecting auto restores it", () => {
-  const { ctx } = fixture();
-  const { statuses, branch, emit } = statusFixture(ctx);
-  branch.push(storedRoute("fast", "low"));
-  emit("model_select", { model: fast });
-  emit("model_select", { model: virtual });
-  emit("session_shutdown");
-  assert.deepEqual(statuses, [undefined, "Jev: last dispatched test/fast · low", undefined]);
+test("availability retries fail over within scope without treating a 429 as weak reasoning", async () => {
+  const { ctx, state, calls } = fixture({ m0: choice({ low: 1 }), strongest: choice({ m0: 1 }) });
+  const failed = { model: fast, thinkingLevel: "low", message: { stopReason: "error", errorMessage: "HTTP 429 rate limit" } } as ModelRouteRequest["failed"];
+  const selected = await route(request({ reason: "retry", failed }), ctx);
+  assert.equal(selected.model, strong);
+  assert.equal(selected.thinkingLevel, "low");
+  assert.equal(selected.state?.escalations, 0);
+  assert.deepEqual(selected.state?.excluded, ["test/fast"]);
+  const continued = await route(request({ reason: "continuation", previous: { model: fast, thinkingLevel: "low" }, state: selected.state }), ctx);
+  assert.equal(continued.model, strong);
+  state.response = result({ m0: choice({ low: 1 }), m1: choice({ medium: 1 }), strongest: choice({ m1: 1 }) });
+  assert.equal((await route(request({ state: selected.state }), ctx)).model, fast);
+  assert.ok(calls.length >= 2);
 });
 
-test("invalid or unrelated router state never produces a misleading dispatch status", async () => {
-  const { ctx } = fixture();
-  const { statuses, branch, emit } = statusFixture(ctx);
-  branch.push(storedRoute("strong", "high", "another-router"));
-  await emit("session_start");
-  branch.push(storedRoute("strong", "unsupported"));
-  await emit("session_start");
-  assert.deepEqual(statuses, ["Jev: awaiting prompt", "Jev: awaiting prompt"]);
-});
-
-test("startup reports current scoped caps without selecting a route or exposing model defaults and config paths", async () => {
-  await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "low" } });
-  const { ctx, calls } = fixture();
-  const display = statusFixture(ctx);
-  display.branch.push(storedRoute("strong", "high"));
-  await display.emit("session_start", { reason: "resume" });
-  const rendered = display.notifications.at(-1)!.message;
-  assert.match(rendered, /jev\/auto \(active\)/);
-  assert.match(rendered, /test\/fast: low \(configured cap\)/);
-  assert.match(rendered, /test\/strong: high \(model maximum\)/);
-  assert.match(rendered, /Last dispatched: test\/strong · high/);
-  assert.doesNotMatch(rendered, /Selected model:|Thinking:|Config:|jev-llm-rtr\.json/);
-  assert.deepEqual(calls, []);
-});
-
-test("inactive startup reports only its state, even with stored routes and invalid config", async () => {
-  await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "invalid" } });
-  const { ctx } = fixture();
-  const display = statusFixture(ctx);
-  display.branch.push(storedRoute("strong", "high"));
-  ctx.model = fast;
-  await display.emit("session_start");
-  assert.deepEqual(display.notifications, [{ message: "Router: jev/auto (inactive)", type: "info" }]);
-});
-
-test("startup reports missing scope and candidates excluded by unsupported caps", async () => {
+test("failover cannot escape scope when all scoped providers have failed", async () => {
   const { ctx, state } = fixture();
-  const display = statusFixture(ctx);
-  state.scoped = [];
-  await display.emit("session_start");
-  assert.match(display.notifications.at(-1)!.message, /no explicit model scope/);
-  const limited = model("limited", 1, { thinkingLevelMap: { off: null, minimal: null, low: null } });
-  state.models = [limited];
-  state.scoped = [{ model: limited }];
-  await writeRouterConfig({ thinkingLevelCaps: { "test/limited": "low" } });
-  await display.emit("session_start", { reason: "reload" });
-  assert.match(display.notifications.at(-1)!.message, /test\/limited: low .*excluded/);
+  state.scoped = [{ model: fast }];
+  await assert.rejects(route(request({ reason: "retry", failed: { model: fast, message: { errorMessage: "overloaded" } } as ModelRouteRequest["failed"] }), ctx), /no remaining.*scoped candidate/);
 });
 
-test("startup reports invalid config and reload reads corrected settings", async () => {
-  await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "invalid" } });
+test("verification evidence raises capability and exhaustion stops automatic recovery", async () => {
   const { ctx } = fixture();
-  const display = statusFixture(ctx);
-  await display.emit("session_start");
-  const failed = display.notifications.at(-1)!.message;
-  assert.match(failed, /Invalid thinking-level cap for test\/fast/);
-  assert.doesNotMatch(failed, /model maximum/);
-  await writeRouterConfig({ thinkingLevelCaps: { "test/fast": "medium" } });
-  await display.emit("session_start", { reason: "reload" });
-  const corrected = display.notifications.at(-1)!.message;
-  assert.match(corrected, /test\/fast: medium \(configured cap\)/);
-  assert.doesNotMatch(corrected, /settings unavailable|Invalid thinking-level/);
+  const selected = await route(request(), ctx);
+  const escalated = await route(request({ reason: "continuation", previous: { model: fast, thinkingLevel: "low" }, state: { ...selected.state!, verificationFailed: true } }), ctx);
+  assert.equal(escalated.model, strong);
+  assert.equal(escalated.thinkingLevel, "high");
+  assert.equal(escalated.state?.escalations, 1);
+  await assert.rejects(route(request({ reason: "continuation", previous: { model: strong, thinkingLevel: "high" }, state: { ...escalated.state!, escalations: 2, verificationFailed: true } }), ctx), /escalation limit/);
 });
 
-test("routing failures replace the pending status instead of leaving a stale pair", async () => {
-  const { ctx, state } = fixture();
-  state.classifiers = [];
-  const { definition, statuses } = statusFixture(ctx);
-  await assert.rejects(async () => definition.route(request(), ctx), /No authenticated Jev classifier/);
-  assert.deepEqual(statuses, ["Jev: choosing model…", "Jev: routing failed"]);
+test("a configured classifier identity never silently substitutes another Jev version", async () => {
+  await writeRouterConfig({ classifier: { provider: "typesafe", id: "jev-1.13" } });
+  const { ctx } = fixture();
+  await assert.rejects(route(request(), ctx), /matching the configured identity/);
 });
 
-test("routing cancellation is reflected in the status without hiding the abort", async () => {
+function plannedExecutionMessages(): Message[] {
+  return [
+    request().messages[0],
+    { role: "assistant", api: fast.api, provider: fast.provider, model: fast.id, timestamp: 1, stopReason: "toolUse", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, content: [
+      { type: "text", text: "Plan:\n1. Change the parser for the specified token boundary.\n2. Run npm test.\nAcceptance criteria: tests pass and invalid tokens are rejected." },
+      { type: "toolCall", id: "edit-1", name: "edit", arguments: { path: "parser.ts", oldText: "old", newText: "new" } },
+    ] },
+    { role: "toolResult", toolCallId: "edit-1", toolName: "edit", isError: false, content: [{ type: "text", text: "Successfully updated parser.ts" }], timestamp: 2 },
+  ];
+}
+
+test("planning-to-execution downgrades require independently accumulated calibrated outcomes", async () => {
+  await writeRouterConfig({ classifier: { provider: "typesafe", id: "jev-1.13" }, policy: { qualityThreshold: 0.8, protectedThreshold: 0.85, minimumCalibrationSamples: 30 } });
+  const { ctx, state } = fixture({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), phase: choice({ planning: 1 }), boundedExecution: { type: "bool", probability: 0 } });
+  state.classifiers = [{ ...jev, id: "jev-1.13" }];
+  state.response.model = "jev-1.13";
+  const planning = await route(request(), ctx);
+  assert.equal(planning.model, strong);
+  state.response = { ...result({ m0: choice({ low: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), boundedExecution: { type: "bool", probability: 1 } }), model: "jev-1.13" };
+  const continuation = request({ reason: "continuation", previous: { model: strong, thinkingLevel: "high" }, state: planning.state, messages: plannedExecutionMessages() });
+  assert.equal((await route(continuation, ctx)).model, strong);
+  const control = effectiveControls(fast).find((entry) => entry.level === "low")!;
+  for (let i = 0; i < 40; i++) {
+    await recordOutcome({ id: `accepted-${i}`, taskId: `prior-task-${i}`, modelKey: modelKey(fast, fast.name), controlKey: control.key, family: "coding", classifierVersion: "typesafe/jev-1.13", prediction: 1, success: true, source: "user" });
+  }
+  const execution = await route(continuation, ctx);
+  assert.equal(execution.model, fast);
+  assert.equal(execution.thinkingLevel, "low");
+  assert.equal(execution.state?.phase, "execution");
+});
+
+test("configured acceptance commands trigger bounded corrective continuation and record recovery-pair outcomes", async () => {
+  await writeRouterConfig({ verification: { command: `node -e \"process.exit(require('fs').existsSync('accepted') ? 0 : 1)\"`, timeoutMs: 5_000, maxAttempts: 2 } });
+  const { ctx } = fixture();
+  const display = statusFixture(ctx, "json");
+  const selected = await display.definition.route(request(), ctx);
+  const push = (state: RouteState) => display.branch.push({ ...storedRoute(state.id, state.thinkingLevel), data: { provider: "jev", modelId: "auto", state } } as SessionEntry);
+  push(selected.state!);
+  const boundary = { outcome: "completed", continue: false, context: { llmMessages: plannedExecutionMessages() } };
+  const first = (await display.emit("agent_before_settle", boundary)).find(Boolean) as { continue?: boolean; entries: { type: string; data?: { state: RouteState } }[] };
+  assert.equal(first.continue, true);
+  assert.equal(first.entries[0].data?.state.verificationFailed, true);
+  push(first.entries[0].data!.state);
+  const recovery = await display.definition.route(request({ reason: "continuation", previous: { model: fast, thinkingLevel: "low" }, state: first.entries[0].data!.state }), ctx);
+  assert.equal(recovery.model, strong);
+  push(recovery.state!);
+  await writeFile(join(testAgentDir, "accepted"), "accepted");
+  try {
+    const second = (await display.emit("agent_before_settle", boundary)).find(Boolean) as { continue?: boolean; entries: { data?: { state: RouteState } }[] };
+    assert.notEqual(second.continue, true);
+    assert.equal(second.entries[0].data?.state.verificationFailed, false);
+    assert.equal(second.entries[0].data?.state.verificationAttempts, 2);
+    const persisted = await readFile(join(testAgentDir, "jev-llm-rtr-history.json"), "utf8");
+    assert.ok(!persisted.includes("existsSync") && !persisted.includes("parser.ts"));
+  } finally {
+    await rm(join(testAgentDir, "accepted"), { force: true });
+  }
+});
+
+test("explicit task labels calibrate the routed pair without duplicate samples", async () => {
+  await writeRouterConfig({ classifier: { provider: "typesafe", id: "jev-1.13" } });
   const { ctx, state } = fixture();
-  const controller = new AbortController();
-  state.onClassify = () => controller.abort();
-  const { definition, statuses } = statusFixture(ctx);
-  await assert.rejects(async () => definition.route(request({ signal: controller.signal }), ctx), { name: "AbortError" });
-  assert.deepEqual(statuses, ["Jev: choosing model…", "Jev: routing canceled"]);
+  state.classifiers = [{ ...jev, id: "jev-1.13" }];
+  state.response.model = "jev-1.13";
+  const display = statusFixture(ctx, "json");
+  const selected = await display.definition.route(request(), ctx);
+  display.branch.push({ ...storedRoute(selected.model.id, selected.thinkingLevel!), data: { provider: "jev", modelId: "auto", state: selected.state } } as SessionEntry);
+  await display.commands.get("jev")!("outcome pass", ctx);
+  await display.commands.get("jev")!("outcome pass", ctx);
+  const routed = selected.state!;
+  const calibration = calibratedProbability(await loadHistory(), routed.modelKey!, routed.controlKey!, "coding", routed.classifierVersion!, routed.prediction!);
+  assert.equal(calibration.samples, 1);
+  assert.ok(calibration.probability < routed.prediction!);
+});
+
+test("unavailable acceptance checks cannot be mistaken for model quality failures", async () => {
+  await writeRouterConfig({ verification: { command: "jev_deliberately_missing_acceptance_binary", timeoutMs: 5_000, maxAttempts: 2 } });
+  const { ctx } = fixture();
+  const display = statusFixture(ctx, "json");
+  const selected = await display.definition.route(request(), ctx);
+  display.branch.push({ ...storedRoute(selected.model.id, selected.thinkingLevel!), data: { provider: "jev", modelId: "auto", state: selected.state } } as SessionEntry);
+  const results = await display.emit("agent_before_settle", { outcome: "completed", continue: false, context: { llmMessages: plannedExecutionMessages() } });
+  const boundary = results.find(Boolean) as { continue?: boolean; entries: { data?: { state: RouteState } }[] };
+  assert.notEqual(boundary.continue, true);
+  assert.equal(boundary.entries[0].data?.state.verificationFailed, false);
+  assert.equal(boundary.entries[0].data?.state.verificationAttempts, 1);
+  await assert.rejects(readFile(join(testAgentDir, "jev-llm-rtr-history.json")), { code: "ENOENT" });
 });

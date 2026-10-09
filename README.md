@@ -45,7 +45,7 @@ Caps are stored in `<agent-dir>/jev-llm-rtr.json`, where `<agent-dir>` is `~/.pi
 }
 ```
 
-Keys use the exact `provider/model-id`. A model without an entry defaults to its highest supported level. Caps limit Jev's choices and sticky follow-up routes. If a cap is below every level supported by a model, Jev excludes that candidate. The config is read on each route, so direct file edits also apply without reloading Pi. Without a UI, `/jev` prints the current scoped levels without opening the picker.
+Keys use the exact `provider/model-id`. A model without an entry defaults to its highest supported effective control. Caps apply to the provider-native control, not just Pi's label. Equivalent levels are collapsed. A forced-high model is excluded by a lower cap, and ambiguous sampling overrides are excluded when a cap is configured. The config is read on each route, so direct file edits apply without reloading Pi. Without a UI, `/jev` prints scoped levels.
 
 ## Update or remove
 
@@ -65,19 +65,82 @@ For a tagged install, use the same tagged source when updating or removing. To s
 
 ## Policy
 
-One Jev call estimates each candidate's minimum sufficient thinking level and identifies the strongest candidate for the task. The router takes the lowest supported thinking level covering 96.7% of Jev's estimated distribution, then selects the cheapest qualifying model. If none qualifies, it uses Jev's strongest candidate at its highest supported level. These estimates are advisory, not verified success rates.
+The router first filters authenticated, explicitly scoped models by image support, effective thinking caps, and full-transcript context fit. Pi's usage-aware token estimate includes tools, images, and thinking without sending private thinking to Jev. Context fit reserves output/reasoning room plus a configurable safety margin. Tokenization and later context hooks can still change the final provider payload.
 
-Cost ranking uses Pi's catalog prices, an approximate input-token count, and a 4,096-token output estimate. It accounts for catalog pricing tiers, but not cache hits, reasoning-token volume, or subscription billing. Equal estimates preserve scope order.
+One batched Jev call estimates each candidate's minimum sufficient **effective native control**, the strongest permitted candidate, task family, risk, verifiability, execution readiness, phase, and answer length. Every qualifying model/control pair is ranked, rather than choosing a model before pricing its effort. The default cumulative threshold is 0.967. This is an advisory classifier quantile, not a measured 96.7% task-success rate.
 
-The chosen pair stays fixed through tool follow-ups and retries while it remains available and scoped. Each new user prompt is reassessed. Router state follows Pi's session branches. Direct requests, such as compaction, reuse the previous pair when possible.
+High-risk tasks, uncertain risk, truncated prompt/system inputs, and images use the strongest scoped candidate at its highest fitting permitted control. Routine low-risk tasks use the cheapest qualifying estimated pair. No stronger model outside your scope or above your caps is introduced.
+
+Cost uses catalog tiers, predicted total billable output including reasoning, cumulative context growth, observed cache-write rates, and inferred recovery overhead. Recent witnessed same-model cache hits can provide a conservative cache-read discount. Observed output and elapsed provider-call time replace cold estimates for the same model/control/task family. Reasoning is a subset of output and is not counted twice. Catalog prices are not subscription billing, and cold latency, task turns, recovery work, and future cache hits remain estimates.
+
+Ordinary tool continuations keep their pair without constructing a classifier projection. Availability failures exclude the failed provider/model for the current task and reassess only remaining scoped candidates. Repeated substantive check failures after corrective edits, configured verification failures, and newly discovered protected work can trigger reassessment. A baseline red test, an unchanged rerun, or an environment error is not automatically evidence of inadequate intelligence. Escalations are bounded. New user prompts reset task-local exclusions and are reassessed.
+
+Planning can hand off to cheaper bounded execution only after an explicit source plan and acceptance checks, successful edit progress, a fresh confident execution assessment, and enough versioned **user-accepted task outcomes** for the execution pair. A successful first edit or a generic passing check cannot authorize a downgrade. Without that evidence, the planning pair is retained. State follows Pi's session branches. Direct requests, including compaction, reuse a fitting permitted previous pair when possible.
+
+Local model discovery uses a registry-local 30-second cache, bounded to 64 entries and simultaneous lookups. Endpoint, authentication, and model-configuration changes invalidate identity. Hot-swapped server models with unchanged configuration can remain cached until the TTL expires. Classification is skipped when only one eligible model/control pair exists; that deterministic path does not establish task verifiability.
+
+### Policy settings
+
+Optional settings share `jev-llm-rtr.json` with thinking caps:
+
+```json
+{
+  "thinkingLevelCaps": {},
+  "classifier": {
+    "provider": "openrouter",
+    "id": "typesafe/jev-1.13"
+  },
+  "policy": {
+    "qualityThreshold": 0.967,
+    "protectedThreshold": 0.995,
+    "contextSafetyTokens": 1024,
+    "latencyUsdPerSecond": 0,
+    "maxEscalations": 2,
+    "historyEnabled": true,
+    "phaseRouting": true,
+    "minimumCalibrationSamples": 30
+  }
+}
+```
+
+The configured classifier must be authenticated and available in Pi. If omitted, the router prefers direct `typesafe/jev-latest`, then another authenticated Jev. A configured identity is never silently substituted. Mutable classifier aliases do not produce version-stable quality calibration. Pin an available release before collecting calibration labels.
+
+`protectedThreshold` governs the stricter calibrated execution handoff. `minimumCalibrationSamples` is only a floor; conservative lower bounds may require substantially more observations to satisfy the threshold. `latencyUsdPerSecond` assigns a dollar-equivalent penalty to elapsed seconds. At its default of zero, latency breaks cost ties. Unknown policy keys or invalid values are rejected.
+
+### Outcomes and learned profiles
+
+Use `/jev stats` to inspect observed usage, task-family reliability profiles, and calibration sample counts. After independently checking the complete task, use `/jev outcome pass` or `/jev outcome fail` to label the latest routed pair on the current branch.
+
+History is stored in `<agent-dir>/jev-llm-rtr-history.json` with a versioned schema, bounded numeric aggregates, hashed identities, and queued atomic writes. It does not store conversation text, image data, credentials, or hidden reasoning. Model configuration/identity, native control, task family, classifier release, and prediction bin isolate quality calibration. The first physical reliability observation and first explicit user-quality label per task/pair are retained independently. Later labels do not correct or inflate them. Recovery pairs can receive separate outcomes.
+
+Quality calibration uses conservative lower bounds from explicit user-acceptance labels and never raises the raw prediction. Configured check outcomes affect reliability/recovery estimates only. These records are not an independent benchmark or a guarantee of task correctness. Evaluate representative held-out tasks against a quality-first scoped baseline before lowering thresholds.
+
+Set `historyEnabled` to `false` to disable learning and persistence. Existing history is left untouched. Corrupt or incompatible history is reported rather than silently reset. Usage-recording failures emit a warning.
+
+### Independent acceptance checks
+
+Checks are opt-in because they execute a shell command in the project directory:
+
+```json
+{
+  "thinkingLevelCaps": {},
+  "verification": {
+    "command": "npm test",
+    "timeoutMs": 60000,
+    "maxAttempts": 3
+  }
+}
+```
+
+Use a trusted, task-appropriate command without destructive side effects. The check runs before settlement only for edited tasks classified as low-risk and independently verifiable. Failure inserts actionable check output and requests bounded corrective continuation with capability reassessment. Timeouts and shell exits 126/127 leave the task unverified without recording a capability failure. Exhaustion reports unmet acceptance checks instead of claiming success. A passing command verifies only its configured contract and does not create a task-quality calibration sample.
 
 ## Context and failures
 
-**Routing sends conversation text to the selected Jev provider**, even when the generation model is local. Jev receives up to 16,000 characters of the latest prompt, 8,000 of system instructions/tool definitions, and 24,000 of recent conversation/tool results. Long entries retain their beginning and end. The generation model still receives Pi's normal context.
+**Routing sends conversation text to the selected Jev provider**, even when the generation model is local. The visible-text projection shares a 48,000-character content budget across the latest prompt, system instructions/tools, recent conversation, source-attributed requirement excerpts, failure excerpts, and omission notices. The prompt and system fields are capped at 16,000 and 8,000 characters. Important middle and older constraints are prioritized, but extraction is not a complete task specification. The generation model still receives Pi's normal context.
 
-Image data and hidden reasoning are not sent to Jev. Requests containing images are restricted to image-capable scoped models, but Jev does not inspect the images themselves.
+Image bytes, hidden reasoning, and provider signatures are not sent to Jev. Image requests are restricted to image-capable scoped models, and their unseen details trigger protected routing.
 
-Missing scope, missing Jev authentication, classifier failures, or invalid fallback decisions stop the request with an error rather than silently choosing an arbitrary model. Routing has a 10-second deadline and respects cancellation.
+Missing scope, insufficient fitting candidates, missing required Jev authentication, classifier failures, invalid fallback decisions, or exhausted capability recovery stop the request with an error rather than choosing an arbitrary model. Classification has a 10-second deadline and respects cancellation. A sole eligible model/control pair does not require Jev authentication.
 
 ## Development
 
