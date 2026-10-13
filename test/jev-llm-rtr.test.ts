@@ -67,7 +67,7 @@ function choice(probabilities: Record<string, number>, selected?: string): Class
 function result(answers: Record<string, ClassifierAnswer>): ClassifierResult {
   const taskAnswers: Record<string, ClassifierAnswer> = {
     taskFamily: choice({ coding: 1 }), risk: choice({ low: 1 }), phase: choice({ execution: 1 }), outputLength: choice({ normal: 1 }),
-    verifiable: { type: "bool", probability: 1 }, boundedExecution: { type: "bool", probability: 0 },
+    verifiable: { type: "bool", probability: 1 }, boundedExecution: { type: "bool", probability: 0 }, preferStrongest: { type: "bool", probability: 0 },
   };
   return { api: jev.api, provider: jev.provider, model: jev.id, answers: { ...taskAnswers, ...answers }, stopReason: "stop", timestamp: 0 };
 }
@@ -231,6 +231,32 @@ test("selects the cheapest sufficient model and Jev's thinking level", async () 
     candidates.map((candidate) => candidate.id),
     ["fast", "strong"],
   );
+});
+
+test("an explicit request for a smarter model selects Jev's strongest scoped route within its cap", async () => {
+  await writeRouterConfig({ thinkingLevelCaps: { "test/strong": "medium" } });
+  const { ctx, calls } = fixture({
+    m0: choice({ low: 0.98, insufficient: 0.02 }),
+    m1: choice({ medium: 0.98, insufficient: 0.02 }),
+    strongest: choice({ m1: 1 }),
+    preferStrongest: { type: "bool", probability: 1 },
+  });
+  const selected = await route(request({ messages: [{ role: "user", content: "Use a smarter model to fix the parser.", timestamp: 0 }] }), ctx);
+  assert.equal(selected.model.id, "strong");
+  assert.equal(selected.thinkingLevel, "medium");
+  assert.match(calls[0].input.questions.preferStrongest.instructions, /latest user prompt directly and explicitly/);
+});
+
+test("a low-confidence stronger-model preference does not override cost-based routing", async () => {
+  const { ctx } = fixture({
+    m0: choice({ low: 0.98, insufficient: 0.02 }),
+    m1: choice({ medium: 0.98, insufficient: 0.02 }),
+    strongest: choice({ m1: 1 }),
+    preferStrongest: { type: "bool", probability: 0.8 },
+  });
+  const selected = await route(request({ messages: [{ role: "user", content: "Use a smarter model to fix the parser.", timestamp: 0 }] }), ctx);
+  assert.equal(selected.model.id, "fast");
+  assert.equal(selected.thinkingLevel, "low");
 });
 
 test("thinking-level caps restrict classifier choices and route fallback maxima", async () => {
