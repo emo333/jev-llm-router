@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { clampThinkingLevel, getSupportedThinkingLevels, type Api, type ClassifierAnswer, type ClassifierQuestion, type Model } from "@earendil-works/pi-ai";
 import { VIRTUAL_MODEL_STATE_ENTRY, type ExtensionAPI, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
-import { localModelName } from "./local-model-name.ts";
+import { hasRemoteEndpoint, localModelName } from "./local-model-name.ts";
 import { clampToCandidateLevels, describeThinkingCap, loadRouterConfig, routingPolicy, saveThinkingLevelCap, routerConfigPath, type RouterConfig } from "./router-config.ts";
 import { effectiveControls } from "./effective-controls.ts";
-import { requestSize, routingContext } from "./routing-context.ts";
+import { promptExcludesLocalModels, requestSize, routingContext } from "./routing-context.ts";
 import { executionEvidence, failureKind, isProtectedTask } from "./execution-evidence.ts";
 import { calibratedProbability, emptyHistory, estimatePair, historyReport, loadHistory, modelKey, recordUsage, type RoutingHistory } from "./routing-history.ts";
 import { installRoutingLifecycle, recordFeedback } from "./routing-lifecycle.ts";
@@ -140,6 +140,14 @@ export async function route(request: ModelRouteRequest<RouteState>, ctx: Extensi
   const routingRetry = request.reason === "retry" && !request.failed && !currentTaskResponded;
   const state = request.reason === "user" || routingRetry ? undefined : request.state;
   if (routingRetry) request = { ...request, state: undefined, previous: undefined };
+  const excludeLocalModels = state?.excludeLocalModels ?? promptExcludesLocalModels(request.messages);
+  if (excludeLocalModels) {
+    const remote = await Promise.all(candidates.map((candidate) => hasRemoteEndpoint(candidate.model, ctx.modelRegistry, request.signal)));
+    request.signal?.throwIfAborted();
+    candidates = candidates.filter((_candidate, i) => remote[i]);
+    if (!candidates.length) throw new Error("Jev found no eligible non-local scoped models. Local models were explicitly excluded; endpoints with unknown locality are also ineligible. Check /scoped-models and provider endpoints.");
+    candidates.forEach((candidate, i) => { candidate.label = `m${i}`; });
+  }
   const evidence = request.reason === "direct" ? undefined : executionEvidence(request.messages);
   const failedAvailability = request.reason === "retry" && request.failed && failureKind(request.failed.message) === "availability";
   const excluded = new Set(state?.excluded ?? []);
@@ -170,14 +178,14 @@ export async function route(request: ModelRouteRequest<RouteState>, ctx: Extensi
     && (request.reason !== "retry" || request.failed)
     && retryFailure !== "availability" && retryFailure !== "context" && sticky && stickyControl) {
     return { model: sticky.model, thinkingLevel: stickyControl.level, state: makeState(request, sticky, stickyControl, {
-      evidenceFingerprint: evidence?.fingerprint,
+      evidenceFingerprint: evidence?.fingerprint, excludeLocalModels,
     }) };
   }
   if (!needsEscalation && candidates.length === 1 && candidates[0].controls.length === 1) {
     const candidate = candidates[0], control = candidate.controls[0];
     return { model: candidate.model, thinkingLevel: control.level, state: makeState(request, candidate, control, {
       assessment: state?.assessment ?? { ...EMPTY_ASSESSMENT, risk: sourceRisk ? "high" : "unknown" }, phase: state?.phase ?? "planning", strongest: { provider: candidate.model.provider, id: candidate.model.id },
-      evidenceFingerprint: evidence?.fingerprint, classifierVersion: "deterministic", prediction: 0, excluded: [...excluded],
+      evidenceFingerprint: evidence?.fingerprint, classifierVersion: "deterministic", prediction: 0, excluded: [...excluded], excludeLocalModels,
     }) };
   }
 
@@ -274,7 +282,7 @@ export async function route(request: ModelRouteRequest<RouteState>, ctx: Extensi
     assessment, phase: assessment.phase,
     strongest: { provider: strongest.model.provider, id: strongest.model.id },
     evidenceFingerprint: evidence?.fingerprint, escalations: (state?.escalations ?? 0) + (needsEscalation ? 1 : 0),
-    verificationFailed: false, classifierVersion, prediction: decision.prediction, excluded: [...excluded],
+    verificationFailed: false, classifierVersion, prediction: decision.prediction, excluded: [...excluded], excludeLocalModels,
   });
   signal.throwIfAborted();
   return { model: decision.candidate.model, thinkingLevel: decision.control.level, state: nextState };

@@ -41,6 +41,23 @@ export function messageText(message: Message): string {
   }).join("\n");
 }
 
+/** Explicit local-model exclusions are eligibility rules, not capability preferences. */
+export function promptExcludesLocalModels(messages: readonly Message[]): boolean {
+  const latest = messages.findLast((message) => message.role === "user");
+  if (!latest) return false;
+  // Code and quoted source material do not issue routing instructions.
+  const prose = messageText(latest)
+    .replace(/```[^]*?(?:```|$)|~~~[^]*?(?:~~~|$)/g, " ")
+    .replace(/`[^`\n]*`|"[^"\n]*"|“[^”]*”|‘[^’]*’|(?<!\w)'[^'\n]*'(?!\w)/g, " ")
+    .split("\n").filter((line) => !/^\s*>/.test(line)).join("\n");
+  const exclusion = /\b(?:exclud(?:e|es|ing)|avoid(?:ing)?|without|no|(?:do\s+not|don['’]t|never)\s+(?:use|choose|select|pick))\s+(?:(?:any|all|the|a)\s+)?local\s+(?:models?|llms?)\b|\b(?:use|choose|select|pick)\s+(?:(?:only|a|the)\s+){0,2}non[-\s]+local\s+(?:models?|llms?)\b/gi;
+  for (const match of prose.matchAll(exclusion)) {
+    // "Do not exclude local models" is not an exclusion.
+    if (!/\b(?:not|never|don['’]t)\s*$/i.test(prose.slice(0, match.index))) return true;
+  }
+  return false;
+}
+
 /** Uses Pi's public estimators on the original transcript, not its classifier projection. */
 export function requestSize(messages: readonly Message[]): { tokens: number; hasImages: boolean } {
   let latestPrefixTimestamp = Number.NEGATIVE_INFINITY;

@@ -37,15 +37,42 @@ const localAddresses = new BlockList();
 for (const [address, prefix] of [["127.0.0.0", 8], ["10.0.0.0", 8], ["172.16.0.0", 12], ["192.168.0.0", 16], ["169.254.0.0", 16], ["100.64.0.0", 10]] as const) {
   localAddresses.addSubnet(address, prefix, "ipv4");
 }
+localAddresses.addAddress("0.0.0.0", "ipv4");
+localAddresses.addAddress("::", "ipv6");
 localAddresses.addAddress("::1", "ipv6");
 localAddresses.addSubnet("fc00::", 7, "ipv6");
 localAddresses.addSubnet("fe80::", 10, "ipv6");
 
-async function isLocalEndpoint(url: URL): Promise<boolean> {
-  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+async function endpointAddresses(url: URL): Promise<{ address: string }[]> {
+  if (url.protocol !== "http:" && url.protocol !== "https:") return [];
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
-  const addresses = isIP(hostname) ? [{ address: hostname }] : await dns.lookup(hostname, { all: true });
-  return addresses.length > 0 && addresses.every(({ address }) => localAddresses.check(address, isIP(address) === 6 ? "ipv6" : "ipv4"));
+  return isIP(hostname) ? [{ address: hostname }] : await dns.lookup(hostname, { all: true });
+}
+
+function isLocalAddress(address: string): boolean {
+  return localAddresses.check(address, isIP(address) === 6 ? "ipv6" : "ipv4");
+}
+
+async function isLocalEndpoint(url: URL): Promise<boolean> {
+  const addresses = await endpointAddresses(url);
+  return addresses.length > 0 && addresses.every(({ address }) => isLocalAddress(address));
+}
+
+/** Fail closed for explicit local exclusions, including auth endpoint overrides and uncertain DNS. */
+export async function hasRemoteEndpoint(model: Model<Api>, registry: Registry, signal?: AbortSignal): Promise<boolean> {
+  signal?.throwIfAborted();
+  const timeout = AbortSignal.timeout(LOOKUP_TIMEOUT_MS);
+  const lookupSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  try {
+    const auth = await abortable(registry.getApiKeyAndHeaders(model), lookupSignal);
+    if (!auth.ok) return false;
+    const addresses = await abortable(endpointAddresses(new URL(auth.baseUrl ?? model.baseUrl)), lookupSignal);
+    lookupSignal.throwIfAborted();
+    return addresses.length > 0 && addresses.every(({ address }) => !isLocalAddress(address));
+  } catch {
+    signal?.throwIfAborted();
+    return false;
+  }
 }
 
 // DNS and Pi's auth resolver do not accept a signal. Stop waiting for either on timeout/cancel.

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Type, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
-import { messageText, requestSize, routingContext, type RoutingContext } from "../src/routing-context.ts";
+import { messageText, promptExcludesLocalModels, requestSize, routingContext, type RoutingContext } from "../src/routing-context.ts";
 
 function assistant(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
   return {
@@ -18,6 +18,48 @@ function contentLength(context: RoutingContext): number {
     + context.requirements.reduce((sum, text) => sum + text.length, 0)
     + context.toolFailures.reduce((sum, text) => sum + text.length, 0);
 }
+
+test("local-model exclusions come from the latest user's unquoted instruction", () => {
+  for (const content of [
+    "use the dumbest model (excluding local models) to create a flow diagram of hoe jev-llm-router works",
+    "Exclude all local models. Make a diagram.",
+    "Do not use a local model for this task.",
+    "Don't choose any local models.",
+    "Never select local LLMs.",
+    "Make a diagram without local models.",
+    "No local models. Use the cheapest candidate.",
+    "Use only non-local models.",
+    "Avoid local models.",
+    "x".repeat(20_000) + " excluding local models " + "y".repeat(20_000),
+  ]) {
+    assert.equal(promptExcludesLocalModels([{ role: "user", content, timestamp: 0 }]), true, content.slice(0, 100));
+  }
+  for (const content of [
+    "Explain how local models work.",
+    "Do not exclude local models.",
+    "Don't avoid local models.",
+    "Do not use non-local models.",
+    'Summarize this example: "excluding local models".',
+    "Summarize 'do not use local models'.",
+    "Summarize “excluding local models”.",
+    "Explain `exclude local models`.",
+    "Explain this code:\n```text\nDo not use local models.\n```",
+    "Explain this code:\n~~~text\nExclude local models.\n~~~",
+    "Explain this quote:\n> Exclude local models.",
+    "Fix local state handling without changing models.",
+  ]) {
+    assert.equal(promptExcludesLocalModels([{ role: "user", content, timestamp: 0 }]), false, content);
+  }
+  assert.equal(promptExcludesLocalModels([
+    { role: "system", content: "Exclude local models.", timestamp: 0 },
+    { role: "user", content: "Exclude local models.", timestamp: 1 },
+    { role: "user", content: "Now fix the parser.", timestamp: 2 },
+    assistant({ content: [{ type: "text", text: "Exclude local models." }] }),
+    { role: "toolResult", toolName: "read", toolCallId: "1", content: [{ type: "text", text: "Do not use local models." }], isError: false, timestamp: 3 },
+  ]), false);
+  assert.equal(promptExcludesLocalModels([{ role: "user", content: [{ type: "text", text: "Exclude local models." }], timestamp: 0 }]), true);
+  assert.equal(promptExcludesLocalModels([]), false);
+});
 
 test("projection retains middle constraints and older requirements within its shared budget", () => {
   const messages: Message[] = [

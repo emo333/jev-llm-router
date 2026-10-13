@@ -43,4 +43,5 @@ export interface RouteState {
   configurationKey?: string;
   resolvedName?: string;
   excluded?: string[];
+  excludeLocalModels?: boolean;
 }

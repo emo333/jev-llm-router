@@ -7,7 +7,7 @@ import { after, before, beforeEach, test } from "node:test";
 import type { Api, ClassifierContext, ClassifierModel, Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { route } from "../src/jev-llm-rtr.ts";
-import { localModelName } from "../src/local-model-name.ts";
+import { hasRemoteEndpoint, localModelName } from "../src/local-model-name.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 let testAgentDir: string;
@@ -74,6 +74,128 @@ function request(overrides: Partial<Parameters<typeof route>[0]> = {}): Paramete
 }
 
 const signal = () => new AbortController().signal;
+const noLocalPrompt = "use the dumbest model (excluding local models) to create a flow diagram of hoe jev-llm-router works";
+
+test("explicitly excluding local models filters them before Jev ranks candidates", async (t) => {
+  const local = localModel({ baseUrl: "http://albert.bamf:8081/v1" });
+  const hosted = localModel({ provider: "hosted", id: "hosted", name: "hosted", baseUrl: "https://api.example.com/v1", reasoning: true });
+  const { ctx, calls } = fixture([local, hosted]);
+  t.mock.method(dns, "lookup", async (hostname: string) => [{ address: hostname === "albert.bamf" ? "10.0.0.230" : "203.0.113.7", family: 4 }]);
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [{ id: "local-native" }] }));
+  const selected = await route(request({ messages: [{ role: "user", content: noLocalPrompt, timestamp: 0 }] }), ctx);
+  assert.equal(selected.model, hosted);
+  assert.deepEqual((calls[0].state.candidates as { provider: string }[]).map((candidate) => candidate.provider), ["hosted"]);
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(selected.state?.excludeLocalModels, true);
+});
+
+test("excluding locals cannot use the sole-pair deterministic shortcut", async (t) => {
+  const { ctx, calls } = fixture();
+  const fetch = t.mock.method(globalThis, "fetch");
+  await assert.rejects(route(request({ messages: [{ role: "user", content: noLocalPrompt, timestamp: 0 }] }), ctx), /no eligible non-local scoped models/);
+  assert.equal(calls.length, 0);
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+test("local exclusion survives continuations and compaction state but resets on a new task", async (t) => {
+  const hosted = localModel({ provider: "hosted", id: "hosted", baseUrl: "https://203.0.113.7/v1" });
+  const { ctx, calls } = fixture([localModel(), hosted]);
+  const selected = await route(request({ messages: [{ role: "user", content: noLocalPrompt, timestamp: 0 }] }), ctx);
+  assert.equal(selected.model, hosted);
+  assert.equal(calls.length, 0);
+  const continuation = await route(request({ reason: "continuation", previous: selected, state: selected.state,
+    messages: [{ role: "user", content: "Compacted task context.", timestamp: 1 }],
+  }), ctx);
+  assert.equal(continuation.model, hosted);
+  assert.equal(continuation.state?.excludeLocalModels, true);
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ data: [{ id: "local-native" }] }));
+  const next = await route(request({ previous: continuation, state: continuation.state }), ctx);
+  assert.equal(next.model.provider, "albert:8081");
+  assert.equal(next.state?.excludeLocalModels, false);
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test("provider-failure retry cannot fall back to an explicitly excluded local", async () => {
+  const hosted = localModel({ provider: "hosted", id: "hosted", baseUrl: "https://203.0.113.7/v1" });
+  const { ctx } = fixture([localModel(), hosted]);
+  const messages = [{ role: "user" as const, content: noLocalPrompt, timestamp: 0 }];
+  const selected = await route(request({ messages }), ctx);
+  const failedMessage = {
+    role: "assistant" as const, api: hosted.api, provider: hosted.provider, model: hosted.id,
+    content: [], stopReason: "error" as const, errorMessage: "503 service unavailable", timestamp: 1,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  };
+  await assert.rejects(route(request({ reason: "retry", messages, state: selected.state,
+    failed: { model: hosted, thinkingLevel: selected.thinkingLevel, message: failedMessage },
+  }), ctx), /no remaining available scoped candidate after provider failures/);
+});
+
+test("classifier strongest fallback sees only non-local candidates", async (t) => {
+  const hosted = localModel({ provider: "hosted", id: "hosted", baseUrl: "https://203.0.113.7/v1", reasoning: true });
+  const { ctx, calls } = fixture([localModel(), hosted]);
+  const classify = ctx.modelRegistry.classify.bind(ctx.modelRegistry);
+  t.mock.method(ctx.modelRegistry, "classify", async (...args: Parameters<typeof classify>) => {
+    const result = await classify(...args);
+    result.answers.m0 = { type: "choice", choice: "insufficient", probabilities: { insufficient: 1 }, confidence: 1 };
+    return result;
+  });
+  const selected = await route(request({ messages: [{ role: "user", content: noLocalPrompt, timestamp: 0 }] }), ctx);
+  assert.equal(selected.model, hosted);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(Object.keys((calls[0].questions.strongest as { criteria: Record<string, string> }).criteria), ["m0"]);
+});
+
+test("zero-cost public models remain eligible regardless of provider or display name", async () => {
+  const hosted = localModel({ baseUrl: "https://203.0.113.7/v1" });
+  const { ctx } = fixture([hosted]);
+  const selected = await route(request({ messages: [{ role: "user", content: noLocalPrompt, timestamp: 0 }] }), ctx);
+  assert.equal(selected.model, hosted);
+});
+
+test("remote eligibility uses resolved endpoints for all APIs without discovery HTTP requests", async (t) => {
+  const { ctx } = fixture();
+  const fetch = t.mock.method(globalThis, "fetch");
+  let endpoint = "http://127.0.0.1:8081/v1";
+  t.mock.method(ctx.modelRegistry, "getApiKeyAndHeaders", async () => ({ ok: true, baseUrl: endpoint }));
+  const configuredPublic = localModel({ api: "anthropic-messages", baseUrl: "https://203.0.113.7/v1" });
+  assert.equal(await hasRemoteEndpoint(configuredPublic, ctx.modelRegistry, signal()), false);
+  endpoint = "https://203.0.113.7/v1";
+  assert.equal(await hasRemoteEndpoint(localModel(), ctx.modelRegistry, signal()), true);
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+test("remote eligibility rejects wildcard, loopback, private, and IPv4-mapped endpoints", async () => {
+  const { ctx } = fixture();
+  for (const baseUrl of ["http://0.0.0.0:8080", "http://[::]:8080", "http://127.0.0.2:8080", "http://10.0.0.230/v1", "http://172.16.0.2/v1", "http://192.168.1.2/v1", "http://100.100.0.2/v1", "http://[::1]/v1", "http://[fd00::1]/v1", "http://[fe80::1]/v1", "http://[::ffff:127.0.0.1]/v1"]) {
+    assert.equal(await hasRemoteEndpoint(localModel({ baseUrl }), ctx.modelRegistry, signal()), false, baseUrl);
+  }
+});
+
+test("unknown and mixed endpoint locality cannot satisfy a no-local constraint", async (t) => {
+  const { ctx } = fixture();
+  const publicModel = localModel({ baseUrl: "https://api.example.com/v1" });
+  const lookup = t.mock.method(dns, "lookup", async () => [{ address: "203.0.113.7", family: 4 }, { address: "10.0.0.1", family: 4 }]);
+  assert.equal(await hasRemoteEndpoint(publicModel, ctx.modelRegistry, signal()), false);
+  lookup.mock.restore();
+  t.mock.method(dns, "lookup", async () => { throw new Error("DNS unavailable"); });
+  assert.equal(await hasRemoteEndpoint(publicModel, ctx.modelRegistry, signal()), false);
+  assert.equal(await hasRemoteEndpoint(localModel({ baseUrl: "not a URL" }), ctx.modelRegistry, signal()), false);
+  assert.equal(await hasRemoteEndpoint(localModel({ baseUrl: "file:///local/model" }), ctx.modelRegistry, signal()), false);
+});
+
+test("cancellation interrupts remote eligibility instead of silently removing the candidate", async (t) => {
+  const { ctx } = fixture();
+  const started = Promise.withResolvers<void>();
+  t.mock.method(ctx.modelRegistry, "getApiKeyAndHeaders", () => {
+    started.resolve();
+    return new Promise(() => {});
+  });
+  const controller = new AbortController();
+  const pending = hasRemoteEndpoint(localModel(), ctx.modelRegistry, controller.signal);
+  await started.promise;
+  controller.abort();
+  await assert.rejects(pending, { name: "AbortError" });
+});
 
 test("local API names reach Jev's metadata and strongest question without changing dispatch", async (t) => {
   const local = Object.freeze(localModel({ baseUrl: "http://albert.bamf:8081/v1" }));
