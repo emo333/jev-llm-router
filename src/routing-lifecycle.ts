@@ -1,6 +1,6 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { VIRTUAL_MODEL_STATE_ENTRY, type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
-import { executionEvidence } from "./execution-evidence.ts";
+import { executionEvidence, toolExecutionEvent, type ExecutionEvent } from "./execution-evidence.ts";
 import { loadRouterConfig, routingPolicy } from "./router-config.ts";
 import { recordOutcome, recordUsage } from "./routing-history.ts";
 import type { RouteState } from "./routing-types.ts";
@@ -29,12 +29,46 @@ export async function recordFeedback(ctx: ExtensionContext, success: boolean): P
 
 export function installRoutingLifecycle(pi: ExtensionAPI): void {
   const starts = new Map<string, number>();
+  const nested = new Map<string, { observation: ExecutionEvent; order: number }[]>();
+  let nestedOrder = 0;
+  pi.on("tool_result", (event, ctx) => {
+    if (ctx.model?.provider !== "jev" || ctx.model.id !== "auto") return;
+    const owner = event.parentToolCallId ?? event.toolCallId;
+    const events = nested.get(owner) ?? [];
+    const descendants = event.parentToolCallId ? nested.get(event.toolCallId) : undefined;
+    if (descendants) {
+      events.push(...descendants);
+      nested.delete(event.toolCallId);
+    }
+    let text = event.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n");
+    let failed = event.isError;
+    // Code mode receives structured bash output, which retains more text than
+    // the model-facing content and can report a nonzero exit without throwing.
+    const structured = event.structuredContent;
+    if (event.toolName === "bash" && structured && typeof structured === "object" && !Array.isArray(structured)) {
+      if ("output" in structured && typeof structured.output === "string") text = structured.output;
+      if ("exit_code" in structured && typeof structured.exit_code === "number" && structured.exit_code !== 0) failed = true;
+    }
+    const observation = toolExecutionEvent(event.toolName, event.input, text, failed);
+    if (observation) events.push({ observation, order: nestedOrder++ });
+    if (events.length || event.parentToolCallId) nested.set(owner, events);
+  });
   pi.on("message_start", (event, ctx) => {
     if (ctx.model?.provider !== "jev" || ctx.model.id !== "auto" || event.message.role !== "assistant") return;
     const message = event.message as AssistantMessage;
     starts.set(`${message.provider}/${message.model}:${message.timestamp}`, performance.now());
   });
   pi.on("message_end", async (event, ctx) => {
+    if (event.message.role === "toolResult") {
+      const events = nested.get(event.message.toolCallId);
+      nested.delete(event.message.toolCallId);
+      if (!events) return;
+      const details = event.message.details;
+      return { message: { ...event.message, details: {
+        ...(details && typeof details === "object" && !Array.isArray(details) ? details : { originalDetails: details ?? null }),
+        jevExecution: { version: 1, events: events.sort((a, b) => a.order - b.order).map(({ observation, order }) => ({ ...observation, order })) },
+      } } };
+    }
     if (event.message.role !== "assistant") return;
     const message = event.message as AssistantMessage;
     const id = `${message.provider}/${message.model}:${message.timestamp}`;
@@ -51,8 +85,9 @@ export function installRoutingLifecycle(pi: ExtensionAPI): void {
       ctx.ui.notify(`Jev could not record routing measurements: ${error instanceof Error ? error.message : String(error)}`, "warning");
     }
   });
-  pi.on("session_shutdown", () => { starts.clear(); });
-  pi.on("session_start", () => { starts.clear(); });
+  pi.on("session_shutdown", () => { starts.clear(); nested.clear(); nestedOrder = 0; });
+  pi.on("session_start", () => { starts.clear(); nested.clear(); nestedOrder = 0; });
+  pi.on("agent_end", () => { nested.clear(); nestedOrder = 0; });
   pi.on("agent_before_settle", async (event, ctx) => {
     if (ctx.model?.provider !== "jev" || ctx.model.id !== "auto" || event.outcome !== "completed" || event.continue) return;
     const config = await loadRouterConfig();

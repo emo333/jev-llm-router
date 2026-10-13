@@ -3,12 +3,13 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
-import type { Api, ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierResult, Message, Model, ModelsClassifierOptions } from "@earendil-works/pi-ai";
+import type { Api, ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierResult, Message, Model, ModelsClassifierOptions, NestedToolCallRecord, ToolResultMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel, ModelRouteRequest, ScopedModel, SessionEntry } from "@earendil-works/pi-coding-agent";
 import extension, { route } from "../src/jev-llm-rtr.ts";
 import { execCommand } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/exec.js";
 import { calibratedProbability, loadHistory } from "../src/routing-history.ts";
 import type { RouteState } from "../src/routing-types.ts";
+import { executionEvidence } from "../src/execution-evidence.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 let testAgentDir: string;
@@ -323,7 +324,7 @@ test("a sole non-reasoning candidate does not require a classifier", async () =>
   assert.equal(calls.length, 0);
 });
 
-test("ordinary tool turns independently raise and lower model and effort for current work", async () => {
+test("ordinary tool continuations retain the task's physical model and effort", async () => {
   const { ctx, state, calls } = fixture();
   const first = await route(request(), ctx);
   state.response = result({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), phase: choice({ planning: 1 }) });
@@ -333,16 +334,17 @@ test("ordinary tool turns independently raise and lower model and effort for cur
   state.response = result({ m0: choice({ low: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), risk: choice({ high: 1 }) });
   const sensitive = await route(request({ reason: "continuation", previous: mechanical, state: mechanical.state, messages: plannedExecutionMessages() }), ctx);
   assert.deepEqual([first, harder, mechanical, sensitive].map(({ model, thinkingLevel }) => [model.id, thinkingLevel]),
-    [["fast", "low"], ["strong", "high"], ["fast", "off"], ["strong", "high"]]);
-  assert.equal(calls.length, 4);
+    [["fast", "low"], ["fast", "low"], ["fast", "low"], ["fast", "low"]]);
+  assert.equal(calls.length, 1);
 });
 
-test("non-availability retries reassess rather than pinning the failed model", async () => {
-  const { ctx } = fixture({ m0: choice({ medium: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
+test("non-availability retries preserve the failed physical pair", async () => {
+  const { ctx, calls } = fixture({ m0: choice({ medium: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
   const failed = { model: strong, thinkingLevel: "high", message: { stopReason: "error", errorMessage: "non-transient provider error" } } as ModelRouteRequest["failed"];
   const selected = await route(request({ reason: "retry", failed, previous: { model: fast, thinkingLevel: "low" } }), ctx);
-  assert.equal(selected.model, fast);
-  assert.equal(selected.thinkingLevel, "medium");
+  assert.equal(selected.model, strong);
+  assert.equal(selected.thinkingLevel, "high");
+  assert.equal(calls.length, 0);
 });
 
 test("direct requests reuse the previous physical pair", async () => {
@@ -634,20 +636,22 @@ function plannedExecutionMessages(): Message[] {
   ];
 }
 
-test("planning and execution switch using fresh adequacy without calibration or phase locks", async () => {
+test("planning, editing and checking retain the selected pair until the next user task", async () => {
   const { ctx, state } = fixture({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), phase: choice({ planning: 1 }) });
   const planning = await route(request(), ctx);
   state.response = result({ m0: choice({ low: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
   const execution = await route(request({ reason: "continuation", previous: planning, state: planning.state, messages: plannedExecutionMessages() }), ctx);
-  assert.equal(execution.model, fast);
-  assert.equal(execution.thinkingLevel, "low");
-  state.response = result({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }), phase: choice({ planning: 1 }) });
-  const nextPlanning = await route(request({ reason: "continuation", previous: execution, state: execution.state, messages: plannedExecutionMessages() }), ctx);
-  assert.equal(nextPlanning.model, strong);
-  assert.equal(nextPlanning.thinkingLevel, "high");
+  assert.equal(execution.model, strong);
+  assert.equal(execution.thinkingLevel, "high");
+  const checking = await route(request({ reason: "continuation", previous: execution, state: execution.state, messages: plannedExecutionMessages() }), ctx);
+  assert.equal(checking.model, strong);
+  assert.equal(checking.thinkingLevel, "high");
+  const nextTask = await route(request({ previous: checking, state: checking.state }), ctx);
+  assert.equal(nextTask.model, fast);
+  assert.equal(nextTask.thinkingLevel, "low");
 });
 
-test("a previous high-risk phase does not pin an independently assessed mechanical turn", async () => {
+test("a high-risk task retains its pair through later mechanical tools", async () => {
   const { ctx } = fixture();
   const goal = { role: "user", content: "Investigate authentication correctness, then correct documentation typos.", timestamp: 0 } as const;
   const sensitive = await route(request({ messages: [goal] }), ctx);
@@ -655,8 +659,8 @@ test("a previous high-risk phase does not pin an independently assessed mechanic
   const messages = plannedExecutionMessages();
   messages[0] = goal;
   const mechanical = await route(request({ reason: "continuation", previous: sensitive, state: sensitive.state, messages }), ctx);
-  assert.equal(mechanical.model, fast);
-  assert.equal(mechanical.thinkingLevel, "low");
+  assert.equal(mechanical.model, strong);
+  assert.equal(mechanical.thinkingLevel, "high");
 });
 
 test("long system boilerplate does not force every otherwise qualified step onto the strongest model", async () => {
@@ -725,4 +729,246 @@ test("unavailable acceptance checks cannot be mistaken for model quality failure
   assert.equal(boundary.entries[0].data?.state.verificationFailed, false);
   assert.equal(boundary.entries[0].data?.state.verificationAttempts, 1);
   await assert.rejects(readFile(join(testAgentDir, "jev-llm-rtr-history.json")), { code: "ENOENT" });
+});
+
+function toolMessages(mode: "direct" | "codemode", records: NestedToolCallRecord[]): Message[] {
+  const template = plannedExecutionMessages()[1];
+  assert.equal(template.role, "assistant");
+  if (mode === "codemode") return [request().messages[0],
+    { ...template, content: [{ type: "toolCall", id: "script", name: "codemode", arguments: { code: "// Filtered script output" } }] },
+    { role: "toolResult", toolCallId: "script", toolName: "codemode", content: [{ type: "text", text: "Script completed" }],
+      isError: false, timestamp: 2, nestedCalls: { complete: true, calls: records } },
+  ];
+  return [request().messages[0], ...records.flatMap((record): Message[] => [
+    { ...template, content: [{ type: "toolCall", id: record.id, name: record.name, arguments: record.arguments ?? {} }] },
+    { role: "toolResult", toolCallId: record.id, toolName: record.name, isError: record.status === "error",
+      content: [{ type: "text", text: record.error ?? "OK" }], timestamp: 2 },
+  ])];
+}
+
+const RED_CHECK = "AssertionError: expected parser to reject input\nexpected: true\nactual: false\nCommand exited with code 1";
+const EDIT_RECORD: NestedToolCallRecord = { id: "edit", name: "edit", status: "ok", arguments: { path: "parser.ts", edits: [{ oldText: "old", newText: "new" }] } };
+const CHECK_RECORD: NestedToolCallRecord = { id: "check", name: "bash", status: "error", arguments: { command: "npm test" }, error: RED_CHECK };
+
+for (const mode of ["direct", "codemode"] as const) {
+  test(`${mode}: read, edit and passing checks do not downgrade a task's model`, async () => {
+    const { ctx, state, calls } = fixture({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
+    let selected = await route(request(), ctx);
+    state.response = result({ m0: choice({ off: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
+    state.classifiers = []; // Continuations do not depend on classifier availability.
+    const records: NestedToolCallRecord[] = [{ id: "read", name: "read", status: "ok", arguments: { path: "parser.ts" } }];
+    for (const record of [undefined, EDIT_RECORD, { ...CHECK_RECORD, status: "ok" as const, error: undefined }]) {
+      if (record) records.push(record);
+      selected = await route(request({ reason: "continuation", previous: selected, state: selected.state, messages: toolMessages(mode, records) }), ctx);
+      assert.equal(selected.model, strong);
+      assert.equal(selected.thinkingLevel, "high");
+    }
+    assert.equal(calls.length, 1);
+  });
+
+  test(`${mode}: failed-check recovery escalates once and retains the recovery pair`, async () => {
+    const { ctx, calls } = fixture();
+    const first = await route(request(), ctx);
+    const messages = toolMessages(mode, [CHECK_RECORD, EDIT_RECORD, { ...CHECK_RECORD, id: "rerun" }]);
+    const recovery = await route(request({ reason: "continuation", previous: first, state: first.state, messages }), ctx);
+    assert.equal(recovery.model, strong);
+    assert.equal(recovery.thinkingLevel, "high");
+    assert.equal(recovery.state?.escalations, 1);
+    const again = await route(request({ reason: "continuation", previous: recovery, state: recovery.state, messages }), ctx);
+    assert.equal(again.model, strong);
+    assert.equal(again.state?.escalations, 1);
+    assert.equal(calls.length, 2);
+  });
+
+  test(`${mode}: final acceptance verification runs after a successful edit`, async () => {
+    await writeRouterConfig({ verification: { command: "node -e 'process.exit(0)'", timeoutMs: 5_000, maxAttempts: 2 } });
+    const { ctx } = fixture();
+    const display = statusFixture(ctx, "json");
+    const selected = await display.definition.route(request(), ctx);
+    display.branch.push({ ...storedRoute(selected.model.id, selected.thinkingLevel!), data: { provider: "jev", modelId: "auto", state: selected.state } } as SessionEntry);
+    const responses = await display.emit("agent_before_settle", {
+      outcome: "completed", continue: false, context: { llmMessages: toolMessages(mode, [EDIT_RECORD]) },
+    });
+    const result = responses.find(Boolean) as { entries: { data?: { state: RouteState } }[] };
+    assert.equal(result.entries[0].data?.state.verificationAttempts, 1);
+    assert.equal(result.entries[0].data?.state.verificationFailed, false);
+  });
+}
+
+test("live nested outcomes survive filtered output, incomplete metadata and session replay without source leakage", async () => {
+  const { ctx } = fixture();
+  const display = statusFixture(ctx, "json");
+  for (const record of [CHECK_RECORD, EDIT_RECORD, { ...CHECK_RECORD, id: "rerun" }]) {
+    await display.emit("tool_result", { toolCallId: `script/${record.id}`, parentToolCallId: "script", toolName: record.name,
+      input: record.arguments, content: [{ type: "text", text: record.error ?? "Successfully updated parser.ts" }], isError: record.status === "error" });
+  }
+  const message = toolMessages("codemode", [EDIT_RECORD])[2] as ToolResultMessage;
+  message.nestedCalls = { complete: false, calls: [] };
+  message.details = { originalField: "preserved" };
+  const responses = await display.emit("message_end", { message });
+  const replacement = (responses.find(Boolean) as { message: ToolResultMessage }).message;
+  assert.equal((replacement.details as { originalField: string }).originalField, "preserved");
+  const replay = JSON.parse(JSON.stringify(replacement)) as ToolResultMessage;
+  const evidence = executionEvidence([request().messages[0], replay]);
+  assert.equal(evidence.edited, true);
+  assert.equal(evidence.failures, 2);
+  assert.equal(evidence.repeatedFailure, true);
+  assert.equal(JSON.stringify(replay.details).includes("parser.ts"), false);
+  assert.equal(JSON.stringify(replay.details).includes("npm test"), false);
+  assert.equal(JSON.stringify(replay.details).includes("AssertionError"), false);
+  // Captured evidence and Pi's nested metadata must never count the same call twice.
+  replay.nestedCalls = { complete: true, calls: [CHECK_RECORD, EDIT_RECORD, { ...CHECK_RECORD, id: "rerun" }] };
+  assert.deepEqual(executionEvidence([request().messages[0], replay]), evidence);
+  const afterCleanup = await display.emit("message_end", { message });
+  assert.equal(afterCleanup.find(Boolean), undefined);
+});
+
+test("nested outcomes preserve successful edits when the enclosing script fails", async () => {
+  const { ctx } = fixture();
+  const display = statusFixture(ctx, "json");
+  await display.emit("tool_result", { toolCallId: "script/edit", parentToolCallId: "script", toolName: "edit",
+    input: EDIT_RECORD.arguments, content: [{ type: "text", text: "Successfully updated parser.ts" }], isError: false });
+  await display.emit("tool_result", { toolCallId: "script/error", parentToolCallId: "script", toolName: "edit",
+    input: EDIT_RECORD.arguments, content: [{ type: "text", text: "oldText must match a unique region" }], isError: true });
+  const message = toolMessages("codemode", [])[2] as ToolResultMessage;
+  message.isError = true;
+  const replacement = ((await display.emit("message_end", { message })).find(Boolean) as { message: ToolResultMessage }).message;
+  assert.equal(executionEvidence([request().messages[0], replacement]).edited, true);
+  assert.equal(executionEvidence([request().messages[0], replacement]).failures, 0);
+});
+
+test("context-overflow retries can replace the pinned pair", async () => {
+  const { ctx, calls } = fixture({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
+  const failed = { model: fast, thinkingLevel: "low", message: { stopReason: "error", errorMessage: "context_length_exceeded" } } as ModelRouteRequest["failed"];
+  const selected = await route(request({ reason: "retry", failed }), ctx);
+  assert.equal(selected.model, strong);
+  assert.equal(calls.length, 1);
+});
+
+test("a new-task routing retry cannot inherit the prior task's cheap pair or recovery state", async () => {
+  const { ctx, state, calls } = fixture();
+  const earlier = await route(request(), ctx);
+  const previousState = { ...earlier.state!, verificationAttempts: 2, verificationFailed: true, escalations: 2, excluded: ["test/strong"] };
+  const messages: Message[] = [...plannedExecutionMessages(), { role: "user", content: "Fix authentication security.", timestamp: 3 }];
+  state.response = { ...state.response, stopReason: "error", errorMessage: "Transient classifier failure" };
+  await assert.rejects(route(request({ messages, previous: earlier, state: previousState }), ctx), /routing failed/);
+  state.response = result({ m0: choice({ low: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
+  const retried = await route(request({ reason: "retry", messages, previous: earlier, state: previousState }), ctx);
+  assert.equal(retried.model, strong);
+  assert.equal(retried.state?.assessment?.risk, "high");
+  assert.equal(retried.state?.escalations, 0);
+  assert.equal(retried.state?.verificationAttempts, undefined);
+  assert.notEqual(retried.state?.taskId, earlier.state?.taskId);
+  assert.deepEqual(retried.state?.excluded, []);
+  assert.equal(calls.length, 3);
+});
+
+test("live nested checks use full structured output and nonzero exit codes", async () => {
+  const { ctx } = fixture();
+  const display = statusFixture(ctx, "json");
+  const output = RED_CHECK + "\nordinary diagnostic chatter".repeat(4_000);
+  for (const record of [CHECK_RECORD, EDIT_RECORD, { ...CHECK_RECORD, id: "rerun" }]) {
+    await display.emit("tool_result", { toolCallId: `script/${record.id}`, parentToolCallId: "script", toolName: record.name,
+      input: record.arguments, content: [{ type: "text", text: record.name === "bash" ? "ordinary diagnostic chatter\nCommand exited with code 1" : "OK" }],
+      isError: false, ...(record.name === "bash" ? { structuredContent: { output, exit_code: 1 } } : {}),
+    });
+  }
+  const message = toolMessages("codemode", [])[2] as ToolResultMessage;
+  const replacement = ((await display.emit("message_end", { message })).find(Boolean) as { message: ToolResultMessage }).message;
+  const evidence = executionEvidence([request().messages[0], replacement]);
+  assert.equal(evidence.failures, 2);
+  assert.equal(evidence.repeatedFailure, true);
+  const details = JSON.stringify(replacement.details);
+  assert.equal(details.includes("AssertionError"), false);
+  assert.equal(details.includes("ordinary diagnostic chatter"), false);
+});
+
+test("nested wrappers preserve actual outcome order across concurrent sibling branches", async () => {
+  const { ctx } = fixture();
+  const display = statusFixture(ctx, "json");
+  await display.emit("tool_result", { toolCallId: "script/wrapper/check", parentToolCallId: "script/wrapper", toolName: "bash",
+    input: CHECK_RECORD.arguments, content: [{ type: "text", text: RED_CHECK }], isError: true });
+  await display.emit("tool_result", { toolCallId: "script/edit", parentToolCallId: "script", toolName: "edit",
+    input: EDIT_RECORD.arguments, content: [{ type: "text", text: "OK" }], isError: false });
+  await display.emit("tool_result", { toolCallId: "script/rerun", parentToolCallId: "script", toolName: "bash",
+    input: CHECK_RECORD.arguments, content: [{ type: "text", text: RED_CHECK }], isError: true });
+  await display.emit("tool_result", { toolCallId: "script/wrapper", parentToolCallId: "script", toolName: "wrapper",
+    input: {}, content: [{ type: "text", text: "Output filtered" }], isError: false });
+  const message = toolMessages("codemode", [])[2] as ToolResultMessage;
+  const replacement = ((await display.emit("message_end", { message })).find(Boolean) as { message: ToolResultMessage }).message;
+  assert.equal(executionEvidence([request().messages[0], replacement]).repeatedFailure, true);
+});
+
+test("direct checks retain structured diagnostics without double-counting transcript results", async () => {
+  const { ctx } = fixture();
+  const display = statusFixture(ctx, "json");
+  const records = [CHECK_RECORD, EDIT_RECORD, { ...CHECK_RECORD, id: "rerun" }];
+  const messages = toolMessages("direct", records);
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    const message = messages[2 + i * 2] as ToolResultMessage;
+    message.content = [{ type: "text", text: "ordinary diagnostic chatter" }];
+    await display.emit("tool_result", { toolCallId: record.id, toolName: record.name, input: record.arguments,
+      content: message.content, isError: false,
+      ...(record.name === "bash" ? { structuredContent: { output: RED_CHECK + "\nordinary diagnostic chatter".repeat(4_000), exit_code: 1 } } : {}),
+    });
+    messages[2 + i * 2] = ((await display.emit("message_end", { message })).find(Boolean) as { message: ToolResultMessage }).message;
+  }
+  const evidence = executionEvidence(messages);
+  assert.equal(evidence.edited, true);
+  assert.equal(evidence.failures, 2);
+  assert.equal(evidence.repeatedFailure, true);
+});
+
+test("concurrent model-issued wrappers merge their nested effects in execution order", async () => {
+  const { ctx } = fixture();
+  const display = statusFixture(ctx, "json");
+  for (const [owner, record] of [["a", CHECK_RECORD], ["b", EDIT_RECORD], ["a", { ...CHECK_RECORD, id: "rerun" }]] as const) {
+    await display.emit("tool_result", { toolCallId: `${owner}/${record.id}`, parentToolCallId: owner, toolName: record.name,
+      input: record.arguments, content: [{ type: "text", text: record.error ?? "OK" }], isError: record.status === "error" });
+  }
+  const template = plannedExecutionMessages()[1];
+  assert.equal(template.role, "assistant");
+  const messages: Message[] = [request().messages[0], { ...template, content: [
+    { type: "toolCall", id: "a", name: "codemode", arguments: { code: "// checks" } },
+    { type: "toolCall", id: "b", name: "codemode", arguments: { code: "// edit" } },
+  ] }];
+  for (const owner of ["a", "b"]) {
+    const message = { ...toolMessages("codemode", [])[2], toolCallId: owner } as ToolResultMessage;
+    messages.push(((await display.emit("message_end", { message })).find(Boolean) as { message: ToolResultMessage }).message);
+  }
+  const evidence = executionEvidence(JSON.parse(JSON.stringify(messages)));
+  assert.equal(evidence.failures, 2);
+  assert.equal(evidence.repeatedFailure, true);
+});
+
+test("routing retries during failover reclassify rather than pinning the unavailable successful pair", async () => {
+  const { ctx, state, calls } = fixture();
+  const earlier = await route(request(), ctx);
+  const messages = plannedExecutionMessages();
+  const failed = { model: fast, thinkingLevel: "low", message: { stopReason: "error", errorMessage: "HTTP 429 rate limit" } } as ModelRouteRequest["failed"];
+  state.response = { ...state.response, stopReason: "error", errorMessage: "Classifier unavailable" };
+  await assert.rejects(route(request({ reason: "retry", messages, previous: earlier, failed, state: earlier.state }), ctx), /routing failed/);
+  state.response = result({ m0: choice({ insufficient: 1 }), m1: choice({ high: 1 }), strongest: choice({ m1: 1 }) });
+  const recovery = await route(request({ reason: "retry", messages, previous: earlier, state: earlier.state }), ctx);
+  assert.equal(recovery.model, strong);
+  assert.equal(calls.length, 3);
+});
+
+test("successful live nested reruns close failure streaks and lifecycle cleanup drops unfinished captures", async () => {
+  const { ctx } = fixture();
+  const display = statusFixture(ctx, "json");
+  for (const record of [CHECK_RECORD, EDIT_RECORD, { ...CHECK_RECORD, id: "rerun" }, { ...CHECK_RECORD, id: "passed", status: "ok", error: undefined }]) {
+    await display.emit("tool_result", { toolCallId: `script/${record.id}`, parentToolCallId: "script", toolName: record.name,
+      input: record.arguments, content: [{ type: "text", text: record.error ?? "OK" }], isError: record.status === "error" });
+  }
+  const message = toolMessages("codemode", [])[2] as ToolResultMessage;
+  const replacement = ((await display.emit("message_end", { message })).find(Boolean) as { message: ToolResultMessage }).message;
+  assert.equal(executionEvidence([request().messages[0], replacement]).repeatedFailure, false);
+  for (const boundary of ["session_start", "session_shutdown", "agent_end"]) {
+    await display.emit("tool_result", { toolCallId: "script/edit", parentToolCallId: "script", toolName: "edit",
+      input: EDIT_RECORD.arguments, content: [{ type: "text", text: "OK" }], isError: false });
+    await display.emit(boundary);
+    assert.equal((await display.emit("message_end", { message })).find(Boolean), undefined);
+  }
 });

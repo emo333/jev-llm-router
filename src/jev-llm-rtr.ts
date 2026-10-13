@@ -131,7 +131,14 @@ export async function route(request: ModelRouteRequest<RouteState>, ctx: Extensi
   const policy = routingPolicy(config);
   const size = requestSize(request.messages);
   let candidates = scopedCandidates(ctx, size.tokens, size.hasImages, config);
-  const state = request.reason === "user" ? undefined : request.state;
+  const taskStart = request.messages.findLastIndex((message) => message.role === "user");
+  const currentTaskResponded = request.messages.slice(taskStart + 1).some((message) =>
+    message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted");
+  // A failed classifier/route has no physical failed response. Its previous pair
+  // and branch state may still belong to an earlier user task.
+  const routingRetry = request.reason === "retry" && !request.failed && !currentTaskResponded;
+  const state = request.reason === "user" || routingRetry ? undefined : request.state;
+  if (routingRetry) request = { ...request, state: undefined, previous: undefined };
   const evidence = request.reason === "direct" ? undefined : executionEvidence(request.messages);
   const failedAvailability = request.reason === "retry" && request.failed && failureKind(request.failed.message) === "availability";
   const excluded = new Set(state?.excluded ?? []);
@@ -142,18 +149,28 @@ export async function route(request: ModelRouteRequest<RouteState>, ctx: Extensi
     candidates.forEach((candidate, i) => { candidate.label = `m${i}`; });
   }
   const findCandidate = (provider: string, id: string) => candidates.find((candidate) => candidate.model.provider === provider && candidate.model.id === id);
-  const previous = request.failed ?? request.previous;
+  const previous = request.failed ?? (routingRetry ? undefined : request.previous);
   const sticky = previous ? findCandidate(previous.model.provider, previous.model.id) : state && findCandidate(state.provider, state.id);
   if (sticky && state?.resolvedName && state.configurationKey === modelKey(sticky.model)) sticky.name = state.resolvedName;
   const stickyLevel = previous?.thinkingLevel ?? state?.thinkingLevel ?? "medium";
   const stickyControl = sticky && sticky.controls.find((control) => control.level === clampToCandidateLevels(sticky.controls.map((entry) => entry.level), stickyLevel));
   const evidenceChanged = evidence && evidence.fingerprint !== state?.evidenceFingerprint;
-  const sourceRisk = request.reason === "user" && isProtectedTask(request.messages);
+  const sourceRisk = (request.reason === "user" || routingRetry) && isProtectedTask(request.messages);
   const needsEscalation = request.reason !== "user" && request.reason !== "direct" && (state?.verificationFailed || (evidenceChanged && (evidence?.repeatedFailure || evidence?.verificationFailed)));
   if (needsEscalation && (state?.escalations ?? 0) >= policy.maxEscalations) throw new Error("Jev stopped after the configured capability escalation limit. The task has not met its acceptance checks.");
   // Direct calls (for example compaction) are outside the agent-turn loop.
   if (request.reason === "direct" && sticky && stickyControl) {
     return { model: sticky.model, thinkingLevel: stickyControl.level };
+  }
+  // Keep one physical pair through exploration, edits and verification for this
+  // user task. Only actual recovery or loss of eligibility permits a handoff.
+  const retryFailure = request.reason === "retry" && request.failed ? failureKind(request.failed.message) : undefined;
+  if (request.reason !== "user" && request.reason !== "direct" && !needsEscalation
+    && (request.reason !== "retry" || request.failed)
+    && retryFailure !== "availability" && retryFailure !== "context" && sticky && stickyControl) {
+    return { model: sticky.model, thinkingLevel: stickyControl.level, state: makeState(request, sticky, stickyControl, {
+      evidenceFingerprint: evidence?.fingerprint,
+    }) };
   }
   if (!needsEscalation && candidates.length === 1 && candidates[0].controls.length === 1) {
     const candidate = candidates[0], control = candidate.controls[0];
@@ -203,7 +220,7 @@ export async function route(request: ModelRouteRequest<RouteState>, ctx: Extensi
   }
   const assessment = assessmentFrom(result.answers);
   if (sourceRisk) assessment.risk = "high";
-  if (request.reason === "user" && assessment.risk === "low" && (size.hasImages || context.omissions.prompt)) assessment.risk = "unknown";
+  if ((request.reason === "user" || routingRetry) && assessment.risk === "low" && (size.hasImages || context.omissions.prompt)) assessment.risk = "unknown";
   const strongestLabel = selectedChoice(result.answers.strongest, candidates.map((candidate) => candidate.label));
   const strongest = candidates.find((candidate) => candidate.label === strongestLabel);
   if (!strongest) throw new Error("Jev returned no valid model decision. No unscoped fallback will be used.");

@@ -204,3 +204,68 @@ test("risk in the middle of a long task is not truncated away", () => {
   const padding = "Ordinary parser detail. ".repeat(2_000);
   assert.equal(isProtectedTask([user(padding + " Preserve authentication security. " + padding)]), true);
 });
+
+function codemode(messages: Message[], isError = false): Message[] {
+  const calls = new Map(messages.flatMap((message) => message.role === "assistant"
+    ? message.content.flatMap((block) => block.type === "toolCall" ? [[block.id, block] as const] : []) : []));
+  const result = tool("codemode", isError ? "Script failed" : "Script completed", isError, "script");
+  result.nestedCalls = {
+    complete: true,
+    calls: messages.flatMap((message) => {
+      if (message.role !== "toolResult") return [];
+      const call = calls.get(message.toolCallId);
+      return [{ id: `script/${message.toolCallId}`, name: message.toolName, arguments: call?.arguments,
+        status: message.isError ? "error" as const : "ok" as const,
+        ...(message.isError ? { error: message.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n") } : {}),
+      }];
+    }),
+  };
+  return [assistant([{ type: "toolCall", id: "script", name: "codemode", arguments: { code: "// Output intentionally filtered" } }]), result];
+}
+
+test("direct and code-mode edits/checks produce equivalent execution evidence", () => {
+  const sequences = [
+    [...check("baseline", RED)],
+    [...check("baseline", RED), ...check("rerun", RED)],
+    [...check("baseline", RED), ...edit(), ...check("rerun", RED)],
+    [...check("baseline", RED), ...edit("failed", true), ...check("rerun", RED)],
+    [...check("baseline", RED), ...edit(), ...check("rerun", RED), ...check("pass", "OK", false)],
+    [...check("baseline", RED), ...edit(), ...check("different", RED.replace("actual: false", "actual: null"))],
+    [...check("first", "FAIL: npm: command not found"), ...edit(), ...check("again", "FAIL: npm: command not found")],
+  ];
+  for (const sequence of sequences) {
+    assert.deepEqual(executionEvidence([user(), ...codemode(sequence)]), executionEvidence([user(), ...sequence]));
+  }
+});
+
+test("a failed code-mode script retains earlier edits without counting failed or unfinished mutations", () => {
+  const messages = codemode([...edit("done"), ...edit("failed", true)], true);
+  const result = messages[1] as ToolResultMessage;
+  result.nestedCalls!.calls.push({ id: "script/unfinished", name: "write", status: "unfinished" });
+  assert.equal(executionEvidence([user(), ...messages]).edited, true);
+  assert.equal(executionEvidence([user(), ...messages]).fingerprint, executionEvidence([user(), ...edit("done")]).fingerprint);
+  assert.equal(executionEvidence([user(), ...codemode(edit("failed", true), true)]).edited, false);
+  assert.deepEqual(executionEvidence([user("Old task"), ...messages, user()]), executionEvidence([user()]));
+});
+
+test("bounded nested metadata detects successful mutations even when their arguments were omitted", () => {
+  const result = tool("codemode", "Script completed");
+  result.nestedCalls = { complete: false, calls: [
+    { id: "script/1", name: "edit", status: "ok", argumentsBytes: 100_000 },
+    { id: "script/2", name: "bash", status: "error", error: RED, argumentsBytes: 20_000 },
+    { id: "script/3", name: "write", status: "unfinished" },
+  ] };
+  const evidence = executionEvidence([user(), result]);
+  assert.equal(evidence.edited, true);
+  assert.equal(evidence.failures, 0);
+  assert.equal(evidence.repeatedFailure, false);
+});
+
+test("nested verifier outcomes are independent of the enclosing script status", () => {
+  const red = tool("codemode", "Script completed");
+  red.nestedCalls = { complete: true, calls: [{ id: "script/1", name: "jev_verify", status: "error", error: "FAIL" }] };
+  assert.equal(executionEvidence([user(), red]).verificationFailed, true);
+  const green = tool("codemode", "Script failed", true);
+  green.nestedCalls = { complete: true, calls: [{ id: "script/2", name: "jev_verify", status: "ok" }] };
+  assert.equal(executionEvidence([user(), red, green]).verificationFailed, false);
+});

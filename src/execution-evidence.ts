@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, ToolResultMessage } from "@earendil-works/pi-ai";
 import type { ExecutionEvidence } from "./routing-types.ts";
 
 const MATCH_LIMIT = 32_000;
@@ -68,7 +68,30 @@ function diagnosticSignature(text: string, command: string): string | undefined 
 }
 
 
-/** Meaningful, task-local evidence; the only persisted identifier is a digest. */
+export type ExecutionEvent = (
+  | { kind: "edit"; key: string }
+  | { kind: "verification"; failed: boolean }
+  | { kind: "check"; key: string; failed: boolean; signature?: string }
+) & { order?: number };
+
+function digest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value) ?? "").digest("hex");
+}
+
+/** Reduce a real tool outcome to evidence without persisting source or output. */
+export function toolExecutionEvent(name: string, args: unknown, text: string, isError: boolean): ExecutionEvent | undefined {
+  if ((name === "edit" || name === "write") && !isError) return { kind: "edit", key: digest([name, args]) };
+  if (name === "jev_verify") return { kind: "verification", failed: isError };
+  const commandSource = args && typeof args === "object" && "command" in args ? args.command : undefined;
+  if (name !== "bash" || typeof commandSource !== "string" || !commandSource.trim()) return;
+  const command = commandSource.trim().replace(/\s+/g, " ");
+  const key = digest(command);
+  if (!isError && !/Command exited with code [1-9]\d*\b/i.test(text)) return { kind: "check", key, failed: false };
+  const signature = diagnosticSignature(text, command);
+  if (signature) return { kind: "check", key, failed: true, signature: digest(signature) };
+}
+
+/** Meaningful, task-local evidence; the only persisted identifiers are digests. */
 export function executionEvidence(messages: readonly Message[]): ExecutionEvidence {
   const start = messages.findLastIndex((message) => message.role === "user");
   const fingerprint = createHash("sha256");
@@ -80,19 +103,48 @@ export function executionEvidence(messages: readonly Message[]): ExecutionEviden
     return result;
   }
   // Calls/results are paired only inside this task, never against stale branch evidence.
-  const calls = new Map<string, { name: string; arguments: unknown; command: string }>();
+  const calls = new Map<string, { name: string; arguments: unknown }>();
   const failedChecks = new Map<string, { signature: string; generation: number; repeated: boolean }>();
   let generation = 0;
   const event = (kind: string, value: unknown) => {
     fingerprint.update(kind).update("\0").update(JSON.stringify(value) ?? "").update("\0");
   };
+  const consume = (observation: ExecutionEvent | undefined) => {
+    if (!observation) return;
+    if (observation.kind === "edit") {
+      result.edited = true;
+      generation++;
+      event("edit", observation.key);
+    } else if (observation.kind === "verification") {
+      result.verificationFailed = observation.failed;
+      if (observation.failed) result.failures++;
+      event("verification", observation.failed);
+    } else if (!observation.failed) {
+      if (failedChecks.delete(observation.key)) event("check-passed", observation.key);
+    } else if (observation.signature) {
+      result.failures++;
+      const previous = failedChecks.get(observation.key);
+      const repeated = previous?.signature === observation.signature && (generation > previous.generation || previous.repeated);
+      failedChecks.set(observation.key, { signature: observation.signature, generation, repeated });
+      event("check-failed", [observation.key, observation.signature, generation]);
+    }
+  };
+  // Sibling tool results can be persisted in a different order than their
+  // nested effects. Merge captured outcomes across the whole assistant batch.
+  const pending: ExecutionEvent[] = [];
+  const flush = () => {
+    if (pending.every((observation) => typeof observation.order === "number")) pending.sort((a, b) => a.order! - b.order!);
+    for (const observation of pending) consume(observation);
+    pending.length = 0;
+  };
   event("task", publicText(messages[start]));
   for (let index = start + 1; index < messages.length; index++) {
     const message = messages[index];
+    if (message.role !== "toolResult") flush();
     if (message.role === "assistant") {
       for (const block of message.content) {
         if (block.type !== "toolCall") continue;
-        calls.set(block.id, { name: block.name, arguments: block.arguments, command: typeof block.arguments.command === "string" ? block.arguments.command : "" });
+        calls.set(block.id, { name: block.name, arguments: block.arguments });
       }
       const text = publicText(message);
       if (sourcePlan(text)) {
@@ -106,33 +158,24 @@ export function executionEvidence(messages: readonly Message[]): ExecutionEviden
     const text = publicText(message);
     const call = calls.get(message.toolCallId);
     const matchingCall = call?.name === message.toolName ? call : undefined;
-    if ((message.toolName === "edit" || message.toolName === "write") && !message.isError) {
-      result.edited = true;
-      generation++;
-      event("edit", [message.toolName, matchingCall?.arguments, text, message.details]);
-      continue;
+    const details = message.details as { jevExecution?: { version: number; events: ExecutionEvent[] } } | undefined;
+    if (details?.jevExecution?.version === 1 && Array.isArray(details.jevExecution.events)) {
+      // Captured live outcomes retain execution order and full diagnostic identity,
+      // even when Pi's bounded nested-call record omitted arguments or errors.
+      pending.push(...details.jevExecution.events);
+    } else {
+      const direct = toolExecutionEvent(message.toolName, matchingCall?.arguments, text, message.isError);
+      if (direct) pending.push(direct);
+      // Resume older sessions using Pi's nested metadata. A failed script does not
+      // undo completed mutations; unfinished or failed mutations are not progress.
+      for (const nested of (message as ToolResultMessage).nestedCalls?.calls ?? []) {
+        if (nested.status === "unfinished") continue;
+        const observation = toolExecutionEvent(nested.name, nested.arguments, nested.error ?? "", nested.status === "error");
+        if (observation) pending.push(observation);
+      }
     }
-    if (message.toolName === "jev_verify") {
-      result.verificationFailed = message.isError;
-      if (message.isError) result.failures++;
-      event("verification", [message.isError, text]);
-      continue;
-    }
-    if (message.toolName !== "bash" || !matchingCall?.command) continue;
-    const command = matchingCall.command.trim().replace(/\s+/g, " ");
-    if (!message.isError && !/Command exited with code [1-9]\d*\b/i.test(text)) {
-      // A successful rerun closes its failure streak, unlike an unrelated read.
-      if (failedChecks.delete(command)) event("check-passed", command);
-      continue;
-    }
-    const signature = diagnosticSignature(text, command);
-    if (!signature) continue;
-    result.failures++;
-    const previous = failedChecks.get(command);
-    const repeated = previous?.signature === signature && (generation > previous.generation || previous.repeated);
-    failedChecks.set(command, { signature, generation, repeated });
-    event("check-failed", [command, signature, generation]);
   }
+  flush();
   result.repeatedFailure = [...failedChecks.values()].some((failure) => failure.repeated);
   result.fingerprint = fingerprint.digest("hex");
   return result;
