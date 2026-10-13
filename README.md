@@ -1,6 +1,6 @@
 # jev-llm-router
 
-A Pi extension that selects a model and thinking level for each agent model turn using Jev, including subagents and nested subagents that select `jev/auto`.
+A Pi extension that uses Jev to select a model and thinking level for each user task, then keeps that pair through ordinary tool continuations. It also supports subagents and nested subagents that select `jev/auto`.
 
 ## Install
 
@@ -69,17 +69,31 @@ For a tagged install, use the same tagged source when updating or removing. To s
 
 The router first filters authenticated, explicitly scoped models by image support, effective thinking caps, and full-transcript context fit. Pi's usage-aware token estimate includes tools, images, and thinking without sending private thinking to Jev. Context fit reserves output/reasoning room plus a configurable safety margin. Tokenization and later context hooks can still change the final provider payload.
 
-When multiple eligible model/control pairs exist, every agent model turn makes a fresh batched Jev assessment of the **next response and tool decisions**. `currentWork` prioritizes the latest visible assistant decision and its tool results. The original prompt and requirements remain constraints, not a fixed complexity level for every step. Jev assesses each candidate's minimum sufficient effective native control, the strongest candidate, current task family, risk, verifiability, phase, and answer length. Qualifying model/control pairs are ranked together. The default cumulative threshold is 0.967, an advisory classifier quantile rather than a measured 96.7% task-success rate.
+When multiple eligible model/control pairs exist, a new user task makes a batched Jev assessment of the **next response and tool decisions**. Ordinary continuations retain the selected physical model and thinking level through exploration, edits, and verification without calling the classifier again. `currentWork` prioritizes the latest visible assistant decision and its tool results when reassessment is needed. The original prompt and requirements remain constraints. Jev assesses each candidate's minimum sufficient effective native control, the strongest candidate, task family, risk, verifiability, phase, and answer length. Qualifying model/control pairs are ranked together. The default cumulative threshold is 0.967, an advisory classifier quantile rather than a measured 96.7% task-success rate.
 
-High-risk or uncertain next steps use the strongest scoped candidate at its highest fitting permitted control. Routine low-risk steps use the cheapest qualifying estimated pair. A prior high-risk phase does not permanently pin later mechanical work. Unseen images or an omitted initial user prompt trigger conservative initial routing. System boilerplate truncation alone does not force every turn onto the strongest model. No model outside your scope or above your caps is introduced.
+High-risk or uncertain assessments use the strongest scoped candidate at its highest fitting permitted control. Low-risk assessments use the cheapest qualifying estimated pair. A high-risk task retains its pair through later mechanical tools rather than automatically downgrading. Unseen images or an omitted initial user prompt trigger conservative initial routing. System boilerplate truncation alone does not require the strongest model. No model outside your scope or above your caps is introduced.
 
 Cost uses catalog tiers, predicted total billable output including reasoning, cumulative context growth, observed cache-write rates, and inferred recovery overhead. Recent witnessed same-model cache hits can provide a conservative cache-read discount. Observed output and elapsed provider-call time replace cold estimates for the same model/control/task family. Reasoning is a subset of output and is not counted twice. Catalog prices are not subscription billing, and cold latency, task turns, recovery work, and future cache hits remain estimates.
 
-User turns, ordinary tool continuations, and retries are all reassessed. The model and effort can increase or decrease as the current work changes, without waiting for a failed check, successful edit, plan, or calibration history. Availability failures exclude the failed provider/model for the current task. Repeated substantive check failures after corrective edits and configured verification failures request bounded capability escalation. A baseline red test, unchanged rerun, or environment error is not automatically evidence of inadequate intelligence. New user prompts reset task-local exclusions.
+A new user prompt always reassesses and resets task-local recovery state and exclusions. During a task, provider availability failures, context overflow, or loss of candidate eligibility can require another route. Availability failures exclude the failed provider/model for that task. Repeated substantive check failures after corrective edits and configured verification failures request bounded capability escalation. A baseline red test, unchanged rerun, or environment error is not automatically evidence of inadequate intelligence. Other physical-provider retries retain the failed pair. Retries after routing or classification itself failed reassess instead of blindly pinning a previous successful pair; a retry before the new task's first physical response cannot inherit the earlier task's recovery state.
 
-Subagents using `jev/auto` independently reassess every model turn, including nested subagents. Subagent extensions must pass the selected virtual model and exact parent candidate scope, not the parent's last physical dispatch or a different settings scope. Explicit physical-model agent overrides bypass virtual routing. State follows Pi's session branches. Direct requests outside the agent loop, including compaction, reuse a fitting permitted previous pair when possible.
+Subagents using `jev/auto` select and retain their own task-level pair, including nested subagents. Subagent extensions must pass the selected virtual model and exact parent candidate scope, not the parent's last physical dispatch or a different settings scope. Explicit physical-model agent overrides bypass virtual routing. State follows Pi's session branches. Direct requests outside the agent loop, including compaction, reuse a fitting permitted previous pair when possible.
 
 Local model discovery uses a registry-local 30-second cache, bounded to 64 entries and simultaneous lookups. Endpoint, authentication, and model-configuration changes invalidate identity. Hot-swapped server models with unchanged configuration can remain cached until the TTL expires. Classification is skipped when only one eligible model/control pair exists; that deterministic path does not establish task verifiability.
+
+### Code mode and direct tools
+
+The same model-stability and recovery rules apply with or without Pi's code mode. No router setting is required. Enable code mode for one session with:
+
+```bash
+pi --tools +codemode --model jev/auto
+```
+
+The router observes individual tool outcomes, including `edit`, `write`, and `bash` calls inside scripts. Successful nested mutations count as edits for final acceptance verification. Meaningful failed checks can trigger escalation even when a script catches the failure or filters its output. Bash diagnostics use structured output when available rather than relying only on truncated model-facing text.
+
+A script failure does not roll back earlier edits. The router records completed mutations without treating failed or unfinished mutations as progress. Outcomes are ordered across sibling tools and nested wrappers so failure tracking does not depend on the order their parent results appear in the transcript. This prevents model handoffs during ordinary read/edit/test work, but does not prevent a model from generating an invalid or overlapping edit.
+
+Digest-only execution evidence is stored in tool-result details for session replay without adding source code, commands, or diagnostic text to those evidence records. Older sessions fall back to Pi's bounded `nestedCalls` metadata; omitted arguments or errors can limit recovery detection.
 
 ### Policy settings
 
@@ -106,7 +120,7 @@ Optional settings share `jev-llm-rtr.json` with thinking caps:
 
 The configured classifier must be authenticated and available in Pi. If omitted, the router prefers direct `typesafe/jev-latest`, then another authenticated Jev. A configured identity is never silently substituted. Mutable classifier aliases do not produce version-stable quality calibration. Pin an available release before collecting calibration labels.
 
-`protectedThreshold` and `minimumCalibrationSamples` set qualification requirements for high-risk or uncertain steps; the strongest fitting permitted route remains their conservative fallback. Calibration history is not required to change models between ordinary steps. The old `phaseRouting` option has been removed and must be removed from existing policy objects. `latencyUsdPerSecond` assigns a dollar-equivalent penalty to elapsed seconds. At its default of zero, latency breaks cost ties. Unknown policy keys or invalid values are rejected.
+`protectedThreshold` and `minimumCalibrationSamples` set qualification requirements for high-risk or uncertain assessments; the strongest fitting permitted route remains their conservative fallback. Calibration history is not required for initial selection or failure escalation. Ordinary tool continuations do not change models based on calibration or phase. The old `phaseRouting` option has been removed and must be removed from existing policy objects. `latencyUsdPerSecond` assigns a dollar-equivalent penalty to elapsed seconds. At its default of zero, latency breaks cost ties. Unknown policy keys or invalid values are rejected.
 
 ### Outcomes and learned profiles
 
@@ -116,7 +130,7 @@ History is stored in `<agent-dir>/jev-llm-rtr-history.json` with a versioned sch
 
 Quality calibration uses conservative lower bounds from explicit user-acceptance labels and never raises the raw prediction. Configured check outcomes affect reliability/recovery estimates only. These records are not an independent benchmark or a guarantee of task correctness. Evaluate representative held-out tasks against a quality-first scoped baseline before lowering thresholds.
 
-Set `historyEnabled` to `false` to disable learning and persistence. Existing history is left untouched. Corrupt or incompatible history is reported rather than silently reset. Usage-recording failures emit a warning.
+Set `historyEnabled` to `false` to disable learned-history reads and writes. Existing history is left untouched. Router state and digest-only execution evidence still follow the session branch. Corrupt or incompatible history is reported rather than silently reset. Usage-recording failures emit a warning.
 
 ### Independent acceptance checks
 
@@ -137,7 +151,7 @@ Use a trusted, task-appropriate command without destructive side effects. The ch
 
 ## Context and failures
 
-**Routing sends conversation text to the selected Jev provider**, even when generation is local. The visible-text projection shares a 48,000-character content budget across the latest prompt, system instructions/tools, prioritized `currentWork`, older conversation, source-attributed requirements, failure excerpts, and omission notices. The prompt and system fields are capped at 16,000 and 8,000 characters. Current work reserves up to 12,000 characters before older history can consume the budget. Important middle and older constraints are prioritized, but extraction is not a complete task specification. The generation model still receives Pi's normal context.
+**When classification is needed, routing sends conversation text to the selected Jev provider**, even when generation is local. The visible-text projection shares a 48,000-character content budget across the latest prompt, system instructions/tools, prioritized `currentWork`, older conversation, source-attributed requirements, failure excerpts, and omission notices. The prompt and system fields are capped at 16,000 and 8,000 characters. Current work reserves up to 12,000 characters before older history can consume the budget. Important middle and older constraints are prioritized, but extraction is not a complete task specification. The generation model still receives Pi's normal context.
 
 Image bytes, hidden reasoning, and provider signatures are not sent to Jev. Image requests are restricted to image-capable scoped models. Unseen image details trigger conservative initial routing and remain explicit in subsequent assessments.
 
