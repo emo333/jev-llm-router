@@ -1,9 +1,10 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { VIRTUAL_MODEL_STATE_ENTRY, type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, VIRTUAL_MODEL_STATE_ENTRY, type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { executionEvidence, toolExecutionEvent, type ExecutionEvent } from "./execution-evidence.ts";
 import { loadRouterConfig, routingPolicy } from "./router-config.ts";
 import { recordOutcome, recordUsage } from "./routing-history.ts";
 import type { RouteState } from "./routing-types.ts";
+import { briefContext, taskPromptKey, taskUserEntryId } from "./task-assessment.ts";
 
 export function latestRouteState(ctx: ExtensionContext): RouteState | undefined {
   const branch = ctx.sessionManager.getBranch();
@@ -28,6 +29,20 @@ export async function recordFeedback(ctx: ExtensionContext, success: boolean): P
 }
 
 export function installRoutingLifecycle(pi: ExtensionAPI): void {
+  // Routing precedes Pi's context transform, so the first physical request receives
+  // its newly persisted brief. It is request-local, never another user task.
+  pi.on("context", (event, ctx) => {
+    if (ctx.model?.provider !== "jev" || ctx.model.id !== "auto") return;
+    const state = latestRouteState(ctx);
+    if (!state?.taskBrief || !state.taskPromptKey) return;
+    if (state.taskEntryId && state.taskEntryId !== taskUserEntryId(ctx)) return;
+    const user = event.messages.findLastIndex((message) => message.role === "user");
+    if (user >= 0 && taskPromptKey(convertToLlm(event.messages.filter((message) => message.role === "user"))) !== state.taskPromptKey) return;
+    const index = user < 0 ? event.messages.length : user + 1;
+    return { messages: [...event.messages.slice(0, index), {
+      role: "custom" as const, customType: "jev-task-brief", content: briefContext(state.taskBrief), display: false, timestamp: 0,
+    }, ...event.messages.slice(index)] };
+  });
   const starts = new Map<string, number>();
   const nested = new Map<string, { observation: ExecutionEvent; order: number }[]>();
   let nestedOrder = 0;

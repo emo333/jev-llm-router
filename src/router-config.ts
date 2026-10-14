@@ -49,8 +49,46 @@ export function routingPolicy(config: RouterConfig): RoutingPolicy {
   return policy;
 }
 
+export interface AssessmentConfig {
+  mode: "off" | "auto" | "always";
+  model: { provider: string; id: string };
+  timeoutMs: number;
+  discoveryTimeoutMs: number;
+  maxFiles: number;
+  maxBytes: number;
+  maxOutputTokens: number;
+  maxAdditionalReads: number;
+}
+
+/** Opt-in: project excerpts may be sent to the explicitly configured scoped assessor. */
+export function assessmentConfig(config: RouterConfig): AssessmentConfig | undefined {
+  if (config.assessment === undefined) return;
+  const raw = objectSetting(config.assessment, "assessment");
+  const allowed = ["mode", "model", "timeoutMs", "discoveryTimeoutMs", "maxFiles", "maxBytes", "maxOutputTokens", "maxAdditionalReads"];
+  for (const key of Object.keys(raw)) if (!allowed.includes(key)) throw new Error(`Invalid Jev assessment setting "${key}".`);
+  const mode = raw.mode ?? "auto";
+  if (!["off", "auto", "always"].includes(mode as string)) throw new Error("Invalid Jev assessment mode.");
+  if (mode === "off") return;
+  const model = objectSetting(raw.model, "assessment.model");
+  if (Object.keys(model).some((key) => !["provider", "id"].includes(key)) ||
+    [model.provider, model.id].some((value) => typeof value !== "string" || !value.trim())) {
+    throw new Error("Jev assessment requires an explicit provider and model id.");
+  }
+  const defaults = { timeoutMs: 90_000, discoveryTimeoutMs: 1_000, maxFiles: 24, maxBytes: 32_768, maxOutputTokens: 24_000, maxAdditionalReads: 3 };
+  const maxima = { timeoutMs: 300_000, discoveryTimeoutMs: 5_000, maxFiles: 64, maxBytes: 65_536, maxOutputTokens: 65_536, maxAdditionalReads: 8 };
+  for (const key of Object.keys(defaults) as (keyof typeof defaults)[]) {
+    const value = raw[key] ?? defaults[key];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < (key === "maxAdditionalReads" ? 0 : 1) || value > maxima[key]) {
+      throw new Error(`Invalid Jev assessment ${key}: expected an integer within ${key === "maxAdditionalReads" ? 0 : 1}..${maxima[key]}.`);
+    }
+    defaults[key] = value;
+  }
+  return { mode: mode as AssessmentConfig["mode"], model: { provider: model.provider as string, id: model.id as string }, ...defaults };
+}
+
 function validateFeatures(config: RouterConfig): void {
   routingPolicy(config);
+  assessmentConfig(config);
   if (config.classifier !== undefined) {
     const classifier = objectSetting(config.classifier, "classifier");
     for (const key of ["provider", "id"]) if (typeof classifier[key] !== "string" || !(classifier[key] as string).trim()) throw new Error(`Invalid Jev router classifier "${key}": expected a nonempty string.`);
@@ -67,6 +105,7 @@ export interface RouterConfig {
   policy?: Partial<RoutingPolicy>;
   classifier?: { provider: string; id: string };
   verification?: { command: string; timeoutMs: number; maxAttempts: number };
+  assessment?: Partial<AssessmentConfig>;
   [key: string]: unknown;
 }
 

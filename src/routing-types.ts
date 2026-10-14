@@ -1,4 +1,4 @@
-import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 
 export type TaskFamily = "mechanical" | "coding" | "reasoning" | "research" | "review" | "unknown";
 export interface TaskAssessment {
@@ -24,7 +24,32 @@ export interface ExecutionEvidence {
   verificationFailed: boolean;
   failures: number;
 }
+export interface TaskBrief {
+  summary: string;
+  deliverables: string[];
+  constraints: string[];
+  architecture: string[];
+  difficulties: string[];
+  capabilities: string[];
+  approach: string[];
+  acceptanceChecks: string[];
+  unknowns: string[];
+  sources: { path: string; fingerprint: string }[];
+}
+export interface RouteDecision {
+  method: "assessment" | "classifier" | "fallback" | "deterministic";
+  reason: string;
+  candidates: { provider: string; id: string; levels: ModelThinkingLevel[] }[];
+  assessor?: { provider: string; id: string; thinkingLevel: ModelThinkingLevel };
+  usage?: Usage[];
+  durationMs?: number;
+  alternatives?: string[];
+}
 export interface RouteState {
+  taskBrief?: TaskBrief;
+  taskPromptKey?: string;
+  taskEntryId?: string;
+  decision?: RouteDecision;
   provider: string;
   id: string;
   thinkingLevel: ModelThinkingLevel;

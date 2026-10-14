@@ -59,7 +59,7 @@ export function promptExcludesLocalModels(messages: readonly Message[]): boolean
 }
 
 /** Uses Pi's public estimators on the original transcript, not its classifier projection. */
-export function requestSize(messages: readonly Message[]): { tokens: number; hasImages: boolean } {
+export function requestSize(messages: readonly Message[], extraTokens = 0, extraAfterIndex = 0): { tokens: number; hasImages: boolean } {
   let latestPrefixTimestamp = Number.NEGATIVE_INFINITY;
   let lastUsageIndex = -1;
   let tokens = 0;
@@ -85,6 +85,9 @@ export function requestSize(messages: readonly Message[]): { tokens: number; has
       tokens += Math.ceil(JSON.stringify(message.toolsRemoved).length / 4);
     }
   }
+  // Request-local context injected after routing is already included in subsequent
+  // provider usage. Add it only when no valid usage from this task covers it.
+  if (lastUsageIndex < extraAfterIndex) tokens += extraTokens;
   return { tokens, hasImages };
 }
 
@@ -119,9 +122,8 @@ function requirementExcerpts(text: string, source: number, role: string): Excerp
 }
 
 /** Bounded, source-labeled evidence; excerpts are instructions/data, never classifier commands. */
-export function routingContext(messages: readonly Message[], size = requestSize(messages)): RoutingContext {
+export function routingContext(messages: readonly Message[], size = requestSize(messages), lastUser = messages.findLastIndex((message) => message.role === "user")): RoutingContext {
   const texts = messages.map(messageText);
-  const lastUser = messages.findLastIndex((message) => message.role === "user");
   const promptSource = texts[lastUser] ?? "";
   const systemSource = messages.flatMap((message, i) => message.role === "system" ? [texts[i]] : []).join("\n\n");
   const prompt = bounded(promptSource, 16_000);

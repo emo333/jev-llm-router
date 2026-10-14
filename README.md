@@ -32,6 +32,42 @@ The router uses your saved scope. You can override the scope for one invocation 
 
 Pi's footer shows the dispatched model and thinking level. The virtual model's own level is `off`, meaning it supplies no fixed reasoning budget. Jev chooses the physical level automatically and ignores thinking-level defaults attached to scoped model entries.
 
+### Bounded task assessment
+
+For substantial tasks, an optional strong-model assessment can inspect a small project context package before choosing the execution model. It produces a reusable task brief rather than discarding its planning work. Enable it in `~/.pi/agent/jev-llm-rtr.json`:
+
+```json
+{
+  "thinkingLevelCaps": {},
+  "assessment": {
+    "mode": "auto",
+    "model": { "provider": "openai-codex", "id": "gpt-6.1-sol" },
+    "timeoutMs": 120000,
+    "discoveryTimeoutMs": 1000,
+    "maxFiles": 24,
+    "maxBytes": 32768,
+    "maxOutputTokens": 24000,
+    "maxAdditionalReads": 3
+  }
+}
+```
+
+The model above is an example, not a benchmark claim. Choose your own quality baseline explicitly. It must be authenticated, physical, in the current scope, and eligible under your caps and context requirements. The assessor uses its highest permitted effective control that fits the assessment's context and output budget. No model is silently substituted or added to scope.
+
+- `auto`: Jev assesses the **whole task** first. A valid low-risk/simple judgment skips the stronger pass. Substantial, uncertain, or high-risk tasks use it.
+- `always`: assess every new user task, without requiring the Jev classifier for initial selection.
+- `off`, or an omitted `assessment`: use classifier-only routing. Assessment is opt-in because it sends selected local source excerpts to the configured model.
+
+Discovery only reads bounded text under the working directory. It prioritizes project instructions, README/manifests and prompt-relevant paths. It does not execute scripts, tests, tools, or subagents. Hidden paths, dependencies, generated output, symlinks, sensitive filenames, binary content and recognizable credentials are excluded. Secret screening is conservative and best-effort, not a guarantee that arbitrary source contains no sensitive data. Only enable discovery for directories you allow this provider to inspect. Supplied conversation context remains subject to the existing classifier projection rules below.
+
+The assessor may request one additional excerpt round, restricted to the discovered inventory. `maxFiles`/`maxBytes` bound the initial package; that extra round is separately bounded by `maxAdditionalReads` and at most 8192 bytes. Fixed traversal limits also apply. The whole assessment has a deadline (default 90000 ms), capped output per call, and cancellation support. Invalid JSON, unsupported recommendations, unavailable assessors or insufficient context stop the route rather than silently weakening policy.
+
+The brief records deliverables, constraints, architecture, difficult work, required capabilities, an approach, acceptance checks, unknowns, and source fingerprints. Checks are **proposed, not executed**. Unresolved design, incomplete verification, unknowns, unseen images or an explicit quality preference retain the configured quality baseline. A cheaper recommendation is accepted only for a validated, bounded, low-risk, independently verifiable handoff. Confidence is not treated as an observed success probability.
+
+The first execution request and subsequent continuations receive the brief as advisory context. It follows the session branch and survives compaction, without becoming a new user task. It never overrides user/system instructions. New user tasks are reassessed and project facts are reread rather than reusing a stale cross-task summary cache. Verify current files before editing; a source fingerprint is not a permanent guarantee of freshness.
+
+Run `/jev explain` to inspect the latest route, eligible candidates/controls, rationale, assessor usage and brief. Assessment usage is recorded separately in router history and route state, not folded into the execution model's response usage. High thinking levels can add substantial startup latency; use `auto`, adjust the cap, or disable assessment when that tradeoff is unsuitable.
+
 ### Thinking-level caps
 
 Run `/jev` to open the scoped-candidate picker. Each model shows its effective highest allowed thinking level. Select a model, then choose one of its supported levels as the cap. Choose `Use model maximum` to remove its cap. Pi saves changes automatically and applies them on the next routed request.
@@ -69,9 +105,9 @@ For a tagged install, use the same tagged source when updating or removing. To s
 
 The router first filters authenticated, explicitly scoped models by image support, effective thinking caps, and full-transcript context fit. Pi's usage-aware token estimate includes tools, images, and thinking without sending private thinking to Jev. Context fit reserves output/reasoning room plus a configurable safety margin. Tokenization and later context hooks can still change the final provider payload.
 
-When multiple eligible model/control pairs exist, a new user task makes a batched Jev assessment of the **next response and tool decisions**. A direct request in the latest user prompt to use a smarter/more capable model or prioritize quality over cost selects Jev's strongest scoped candidate at its highest fitting permitted control. Quoted text, code, examples, tool output, and older conversation do not count as that preference. Ordinary continuations retain the selected physical model and thinking level through exploration, edits, and verification without calling the classifier again. `currentWork` prioritizes the latest visible assistant decision and its tool results when reassessment is needed. The original prompt and requirements remain constraints. Jev assesses each candidate's minimum sufficient effective native control, the strongest candidate, task family, risk, verifiability, phase, and answer length. Qualifying model/control pairs are ranked together. The default cumulative threshold is 0.967, an advisory classifier quantile rather than a measured 96.7% task-success rate.
+When multiple eligible model/control pairs exist, a new user task makes a batched Jev assessment of the **whole requested task, including its hardest reasonably expected phase**, because the selected pair will remain in use through ordinary continuations. A direct request in the latest user prompt to use a smarter/more capable model or prioritize quality over cost selects Jev's strongest scoped candidate at its highest fitting permitted control. Quoted text, code, examples, tool output, and older conversation do not count as that preference. Ordinary continuations retain the selected physical model and thinking level through exploration, edits, and verification without calling the classifier again. `currentWork` prioritizes the latest visible assistant decision and its tool results when reassessment is needed. The original prompt and requirements remain constraints. Jev assesses each candidate's minimum sufficient effective native control, the strongest candidate, task family, risk, verifiability, phase, and answer length. Qualifying model/control pairs are ranked together. The default cumulative threshold is 0.967, an advisory classifier quantile rather than a measured 96.7% task-success rate.
 
-High-risk or uncertain assessments use the strongest scoped candidate at its highest fitting permitted control. Low-risk assessments use the cheapest qualifying estimated pair unless the latest user explicitly requests the strongest route. A high-risk task retains its pair through later mechanical tools rather than automatically downgrading. Unseen images or an omitted initial user prompt trigger conservative initial routing. System boilerplate truncation alone does not require the strongest model. No model outside your scope or above your caps is introduced.
+In classifier-only routing, high-risk or uncertain assessments use the classifier's strongest scoped candidate at its highest fitting permitted control. Low-risk assessments use the cheapest qualifying estimated pair unless the latest user explicitly requests the strongest route. A high-risk task retains its pair through later mechanical tools rather than automatically downgrading. Unseen images or an omitted initial user prompt trigger conservative initial routing. System boilerplate truncation alone does not require the strongest model. No model outside your scope or above your caps is introduced.
 
 Cost uses catalog tiers, predicted total billable output including reasoning, cumulative context growth, observed cache-write rates, and inferred recovery overhead. Recent witnessed same-model cache hits can provide a conservative cache-read discount. Observed output and elapsed provider-call time replace cold estimates for the same model/control/task family. Reasoning is a subset of output and is not counted twice. Catalog prices are not subscription billing, and cold latency, task turns, recovery work, and future cache hits remain estimates.
 
@@ -79,7 +115,21 @@ A new user prompt always reassesses and resets task-local recovery state and exc
 
 Subagents using `jev/auto` select and retain their own task-level pair, including nested subagents. Subagent extensions must pass the selected virtual model and exact parent candidate scope, not the parent's last physical dispatch or a different settings scope. Explicit physical-model agent overrides bypass virtual routing. State follows Pi's session branches. Direct requests outside the agent loop, including compaction, reuse a fitting permitted previous pair when possible.
 
-Local model discovery uses a registry-local 30-second cache, bounded to 64 entries and simultaneous lookups. Endpoint, authentication, and model-configuration changes invalidate identity. Hot-swapped server models with unchanged configuration can remain cached until the TTL expires. Classification is skipped when only one eligible model/control pair exists; that deterministic path does not establish task verifiability.
+Local model discovery uses a registry-local 30-second cache, bounded to 64 entries and simultaneous lookups. Endpoint, authentication, and model-configuration changes invalidate identity. Hot-swapped server models with unchanged configuration can remain cached until the TTL expires. With task assessment disabled, classification is skipped when only one eligible model/control pair exists; that deterministic path does not establish task verifiability.
+
+### Subagent setup
+
+Agent definitions are separate from this router. In your active `~/.pi/agent/agents/*.md` files, include `codemode` in explicit tool lists if agents should use it. A list such as `tools: read, grep, find, ls, bash` replaces global tool defaults and excludes codemode even when `defaultTools` contains `"+codemode"`. For example:
+
+```yaml
+tools: read, grep, find, ls, bash, codemode
+```
+
+Keep the planner's list read-only (`read, grep, find, ls, codemode`). Bash availability is not a filesystem sandbox. Leave `model` absent to inherit the parent's selected model and scope, or set an explicit model deliberately. Selecting a physical parent bypasses Jev in inheriting children too.
+
+A brief-aware subagent extension can read the latest matching `pi.virtual-model-state` entry's `data.state.taskBrief` and prepend it as advisory parent context to the delegated task. Only do so for a selected `jev/auto` parent, never fall back past a newer matching route without a brief, and omit an oversized brief rather than truncating its JSON (maximum 12000 characters). The delegated task determines the child's scope; the parent brief is not an instruction to redo the whole project.
+
+Use focused scouts and one integration owner for substantial changes, then an independent reviewer against the original requirements. Require source references and explicit verification gaps. Do not invoke every profile, repeat tests unnecessarily, or allow concurrent writers to own the same files. Separate agent contexts still share the working directory. The optional installed-subagent integration tests cover this handoff contract in addition to model/scope inheritance.
 
 ### Code mode and direct tools
 
